@@ -1,0 +1,125 @@
+{
+  "agsSchema": {
+    "name": "AGSi",
+    "version": "1.0.1",
+    "link": "https://ags-data-format-wg.gitlab.io/agsi/agsi_standard/1.0.1/"
+  },
+  "agsFile": {
+    "title": "Silvertown mini",
+    "projectTitle": "Silvertown Tunnel",
+    "description": "Small AGSi 1.0.1 package with a 2D section model linked to a plan alignment.",
+    "producedBy": "evo-data-converters tests",
+    "remarks": "Test fixture: trimmed excerpt of the AGSi 1.0.1 conversion of the published AGSi example 'Silvertown2D_wkt_1.agsi'. Only the first 6 vertices of the NB alignment and of three section profiles are kept (verbatim full-precision coordinates), and only two model elements."
+  },
+  "agsProject": {
+    "projectName": "Silvertown Tunnel",
+    "agsProjectCoordinateSystem": [
+      {
+        "systemID": "NB-Section-XZ",
+        "description": "2D vertical section along alignment NB: X = chainage along the alignment, Z = elevation",
+        "systemType": "XZ",
+        "axisNameX": "Chainage",
+        "axisNameZ": "Elevation",
+        "axisUnitsXY": "m",
+        "axisUnitsZ": "m",
+        "remarks": "Chainage is measured along agsiModelAlignment 'NB' (startChainage 0). Vertical datum is not stated in the source package; elevations are retained as supplied and no vertical system is asserted."
+      },
+      {
+        "systemID": "BNG-XY",
+        "description": "2D map: British National Grid easting/northing",
+        "systemType": "XY",
+        "systemNameXY": "British National Grid (EPSG:27700)",
+        "axisNameX": "Easting",
+        "axisNameY": "Northing",
+        "axisUnitsXY": "m",
+        "axisUnitsZ": "m",
+        "globalXYSystem": "EPSG:27700",
+        "remarks": "The source package states no coordinate reference system. EPSG:27700 (British National Grid) is inferred: coordinates E 539k / N 179-181k transform to 51.495N 0.005E (Greenwich Peninsula portal) and 51.508N 0.013E (Silvertown portal) of the Silvertown Tunnel. axisUnitsZ is required by the schema but unused by this XY system."
+      }
+    ]
+  },
+  "agsiModel": [
+    {
+      "modelID": "Silvertown-mini-NB-Section",
+      "modelName": "Silvertown mini NB section",
+      "modelType": "Geotechnical model",
+      "category": "Observational",
+      "coordSystemID": "NB-Section-XZ",
+      "alignmentID": "NB",
+      "agsiModelElement": [
+        {
+          "elementID": "Profile Surficial Alignment NB",
+          "description": "Profile follows 'NB' alignment and 'Surficial' surface",
+          "elementType": "Geological unit",
+          "agsiGeometry": {
+            "description": "Surficial",
+            "agsiGeometryTop": {
+              "description": "Top of Surficial",
+              "geometryType": "Profile",
+              "fileFormat": "WKT",
+              "fileURI": "Profiles/NB_Alignment-01-Surficial-Top.txt",
+              "revision": "Revision P2, issued 25/11/2022 10:23:07",
+              "revisionInfo": "Need to add some details here",
+              "remarks": "Surficial"
+            },
+            "agsiGeometryBottom": {
+              "description": "Base of Surficial",
+              "geometryType": "Profile",
+              "fileFormat": "WKT",
+              "fileURI": "Profiles/NB_Alignment-01-Surficial-Base.txt",
+              "revision": "Revision P2, issued 25/11/2022 10:23:07",
+              "revisionInfo": "Need to add some details here",
+              "remarks": "Surficial"
+            },
+            "remarks": "Some remarks"
+          },
+          "geometryObject": "agsiGeometryAreaFromLines"
+        },
+        {
+          "elementID": "Profile Alluvium Alignment NB",
+          "description": "Profile follows 'NB' alignment and 'Alluvium' surface",
+          "elementType": "Geological unit",
+          "agsiGeometry": {
+            "description": "Alluvium",
+            "agsiGeometryTop": {
+              "description": "Top of Alluvium",
+              "geometryType": "Profile",
+              "fileFormat": "WKT",
+              "fileURI": "Profiles/NB_Alignment-02-Alluvium-Top.txt",
+              "revision": "Revision P2, issued 25/11/2022 10:23:07",
+              "revisionInfo": "Need to add some details here",
+              "remarks": "Alluvium"
+            },
+            "remarks": "Some remarks"
+          },
+          "geometryObject": "agsiGeometryAreaFromLines"
+        }
+      ],
+      "remarks": "Section model; its alignmentID 'NB' refers to the agsiModelAlignment in the plan model."
+    },
+    {
+      "modelID": "Silvertown-NB-Alignment-Plan",
+      "modelName": "Silvertown Tunnel NB alignment (plan)",
+      "description": "2D map (XY) model holding the NB section alignment referenced by the NB section model (agsiModel alignmentID 'NB').",
+      "coordSystemID": "BNG-XY",
+      "usage": "Defines the plan alignment of the section model only; contains no model elements.",
+      "agsiModelAlignment": [
+        {
+          "alignmentID": "NB",
+          "alignmentName": "NB alignment",
+          "description": "Plan (XY) alignment of the NB section, Silvertown Tunnel",
+          "agsiGeometry": {
+            "geometryID": "GEOM-ALIGNMENT-NB",
+            "description": "NB alignment centre line (XY)",
+            "geometryType": "Line",
+            "fileFormat": "WKT",
+            "fileURI": "Alignments/NB_Alignment.txt",
+            "remarks": "First 6 XY vertices (full precision) of the NB alignment of the converted Silvertown package."
+          },
+          "startChainage": 0,
+          "remarks": "Vertex i of every section profile corresponds to vertex i of this alignment (6 vertices); the profile chainage equals the cumulative XY length of this alignment at every vertex."
+        }
+      ]
+    }
+  ]
+}
