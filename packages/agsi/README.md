@@ -30,8 +30,8 @@ Converts [AGSi](https://ags-data-format-wg.gitlab.io/agsi/agsi_standard/latest/)
 to and from Evo `geological-sections` objects.
 
 > **Status:** work in progress. This release contains the AGSi **reader**, the 2D **section
-> geometry engine** and the **importer** (`convert_agsi`) for straight 2D sections;
-> `export_agsi` (export) still raises `NotImplementedError`.
+> geometry engine**, the **importer** (`convert_agsi`) and the **exporter** (`export_agsi`) for
+> straight 2D sections. `export_blocksync_agsi` (block models) still raises `NotImplementedError`.
 
 ### Importing AGSi into Evo
 
@@ -72,10 +72,63 @@ Object layout:
 | `surfaces` | one per distinct top/bottom line (`ContactSurface`); generated horizontal lines are `BoundarySurface` |
 | `materials`, `layer_order` | one per element (`colourRGB` or a default colour), top to bottom |
 | `volume_attributes` | `elementID`, `elementType`, and one attribute per `agsiDataParameterValue` code (and case); numeric values are continuous, others strings |
-| `extensions.agsi` | `schemaVersion`, `modelID`, `modelName`, `coordSystemID`, `alignmentID`, `alignmentName`, `startChainage`, `alignmentLength` |
+| `extensions.agsi` | `schemaVersion`, `modelID`, `modelName`, `coordSystemID`, `alignmentID`, `alignmentName`, `startChainage`, `alignmentLength`; `parameterColumns` maps attribute names of parameters with a `caseID` to their `codeID` and `caseID` |
 
 Models without section areas (plan models holding alignments, 3D models of surfaces) are skipped.
 `valueProfile` parameters are not converted.
+
+### Exporting Evo to AGSi
+
+`export_agsi` downloads Evo `geological-sections` objects and writes them to one AGSi 1.0.1
+package: `index.json`, the main JSON file and one WKT file per distinct line.
+
+```python
+from evo.data_converters.agsi import export_agsi
+from evo.data_converters.common import EvoObjectMetadata
+
+export_agsi(
+    "sections.agsi",
+    objects=[EvoObjectMetadata(object_id=object_id)],  # optionally version_id=...
+    evo_workspace_metadata=workspace_metadata,  # or service_manager_widget=...
+)
+```
+
+`from evo.data_converters.agsi.exporter import build_agsi_export, SectionsSource` builds the same
+package from objects already in memory: `build_agsi_export([SectionsSource(obj, load_table)], title)`
+(`load_table` returns the `pyarrow.Table` of a data component); `.write(path)` writes it.
+
+| AGSi | From Evo |
+| --- | --- |
+| `agsFile`, `agsProject` | the file name; per section model one `XZ` coordinate system (chainage, elevation; `systemID` from `coordSystemID`), and one `XY` system per distinct object CRS (`Evo-XY`; `globalXYSystem` `EPSG:n` for EPSG codes; name, axes and units from the CRS, `unknown` units without one) |
+| section `agsiModel` | one per section; `modelID`, `modelName`, `coordSystemID` and `alignmentID` from `extensions.agsi` when the object has a single section, else derived from the object and section names; the Evo folder path is noted in `remarks` |
+| plan `agsiModel`, `agsiModelAlignment` | one plan model per object holding a straight 2-point alignment through the section origin along its strike, from `startChainage` to `startChainage + alignmentLength` (from `extensions.agsi` when they cover the profiles, else the profiles' chainage range) |
+| `agsiModelElement` | one per volume, in `layer_order`; `elementID` from the `elementID` attribute (else `layer`, `material_key`, `name`); `elementName` from the volume name when different; `colourRGB` from the material |
+| `agsiGeometryAreaFromLines` | top and bottom WKT `LINESTRING (chainage elevation, ...)` profiles; identical lines (shared contacts) are written once and referenced by both units |
+| `agsiModelBoundary` | `topElevation` / `bottomElevation` when a generated horizontal `BoundarySurface` line closes the units at one elevation; that line is then omitted from the profiles |
+| `agsiDataParameterValue` | one per volume attribute value: continuous and integer → `valueNumeric`, string and category → `valueText`; `codeID`/`caseID` from `parameterColumns`, else the attribute name. Missing values are skipped; other attribute types (e.g. bool) are not exported (with a warning) |
+
+Constraints (each raises `UnsupportedSectionGeometryError` and nothing is written):
+
+* The section must be a vertical plane (`dip` 90°); chainage is along strike and elevation is
+  `v + origin.z`.
+* Each volume must be a single ring without internal rings, with non-zero area, that splits at its
+  lowest- and highest-chainage vertices into one top and one bottom line, each strictly increasing
+  in chainage (no overhangs or vertical steps) with the top never below the bottom.
+
+Other behaviour:
+
+* A unit that pinches out is several Evo volumes; each is written as its own element,
+  `"<elementID> (part n)"`, with a remark. The zero-thickness gaps between them are not
+  reconstructed from neighbouring units.
+* Sections without volumes are skipped; an object with no volumes, a non-`geological-sections`
+  object or an empty object list raise `AGSIExporterException` / `UnsupportedObjectError`.
+* Not kept: the original XY `systemID`, geometry descriptions, revisions and remarks; palette
+  colours become explicit `colourRGB`; mixed numeric/text parameters (stored as strings in Evo)
+  come back as `valueText`.
+
+Round trip: for units that do not pinch out, importing an AGSi file, exporting it and importing the
+result gives the same `line_geometry` vertices, sections, volumes, materials, attributes and
+extensions. Exported packages validate against the AGSi 1.0.1 JSON schema.
 
 ### Reading AGSi packages
 
@@ -211,11 +264,12 @@ containing AGSi 1.0.1 conversions of them, named like the originals (`Silvertown
 and `Silvertown3D_{wkt,dxf,stl}.agsi`). Their NB/SB alignments are curved, so the geometry and
 importer tests check that they are rejected (the 3D models are rejected for their 3D profiles); an
 optional `Silvertown2D_wkt_straight_synthetic.agsi` in the same folder (the same units on a
-straight alignment) is built and converted end to end.
+straight alignment) is built and converted end to end, then exported and checked against the
+source profiles.
 
-All tests are offline: the importer tests build the objects with a local data client that writes
-parquet files to a temporary folder, mock the Evo clients and publishing, and fail on any
-non-loopback network connection.
+All tests are offline: the importer and exporter tests build and read the objects with a local
+data client that writes parquet files to a temporary folder, mock the Evo clients, publishing and
+downloads, and fail on any non-loopback network connection.
 
 
 ## Code of conduct

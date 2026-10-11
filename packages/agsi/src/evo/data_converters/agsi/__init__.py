@@ -11,12 +11,21 @@
 
 from .importer.agsi_reader import AGSIDataFileIOError, AGSIInvalidDataError, AGSIUnsupportedVersionError
 from .importer.agsi_to_evo import convert_agsi
-from .exporter import export_blocksync_agsi, export_agsi
+from .exporter import (
+    AGSIExporterException,
+    UnsupportedObjectError,
+    UnsupportedSectionGeometryError,
+    export_agsi,
+    export_blocksync_agsi,
+)
 
 __all__ = [
     "AGSIDataFileIOError",
+    "AGSIExporterException",
     "AGSIInvalidDataError",
     "AGSIUnsupportedVersionError",
+    "UnsupportedObjectError",
+    "UnsupportedSectionGeometryError",
     "convert_agsi",
     "export_agsi",
     "export_blocksync_agsi",

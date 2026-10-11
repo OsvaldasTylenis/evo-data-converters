@@ -265,7 +265,7 @@ def _volume_attributes(
                 if parameter.value_profile is not None:
                     logger.warning(f"Element '{key}': valueProfile of '{parameter.code_id}' is not converted.")
                 continue
-            column = parameter.code_id if parameter.case_id is None else f"{parameter.code_id} ({parameter.case_id})"
+            column = _parameter_column(parameter.code_id, parameter.case_id)
             values = columns.setdefault(column, {})
             if key in values:
                 logger.warning(f"Element '{key}': repeated parameter '{column}'; the first value is kept.")
@@ -285,6 +285,21 @@ def _volume_attributes(
                 _string_attribute(data_client, column, [None if v is None else _text(v) for v in row_values])
             )
     return attributes
+
+
+def _parameter_column(code_id: str, case_id: Optional[str]) -> str:
+    return code_id if case_id is None else f"{code_id} ({case_id})"
+
+
+def _parameter_columns(section: ModelSection) -> dict[str, dict[str, str]]:
+    """codeID and caseID of the attribute columns of parameters with a caseID."""
+    columns: dict[str, dict[str, str]] = {}
+    for element in section.elements.values():
+        for parameter in element.agsi_data_parameter_value:
+            if parameter.code_id is not None and parameter.case_id is not None:
+                column = _parameter_column(parameter.code_id, parameter.case_id)
+                columns.setdefault(column, {"codeID": parameter.code_id, "caseID": parameter.case_id})
+    return columns
 
 
 def _text(value: Any) -> str:
@@ -321,6 +336,9 @@ def _agsi_extension(
         extension["alignmentName"] = alignment.alignment_name
         extension["startChainage"] = section.frame.start_chainage
         extension["alignmentLength"] = section.frame.length
+    parameter_columns = _parameter_columns(section)
+    if parameter_columns:
+        extension["parameterColumns"] = parameter_columns
     return {key: value for key, value in extension.items() if value is not None}
 
 

@@ -18,16 +18,18 @@ import uuid
 from evo.data_converters.common import EvoObjectMetadata, EvoWorkspaceMetadata
 from evo.data_converters.agsi.exporter import export_agsi
 
-parser = argparse.ArgumentParser(description="Export Evo Object(s) to a AGSI file")
+parser = argparse.ArgumentParser(
+    description="Export Evo geological-sections object(s) to an AGSi 1.0.1 package (.agsi)"
+)
 
-parser.add_argument("filename", help="Path of the AGSI file to create.")
+parser.add_argument("filename", help="Path of the .agsi file to create.")
 
 parser.add_argument(
     "--object",
     action="append",
     help="UUID of an Evo object to export, with an optional colon-separated version of the object. "
     "Defaults to the latest version. Supply multiple --object arguments to export multiple "
-    "objects to the AGSI file.",
+    "objects to the AGSi package.",
     required=True,
     default=[],
 )
@@ -88,7 +90,7 @@ for obj_str in args.object:
         object_metadata = EvoObjectMetadata(object_id=uuid.UUID(obj_str))
 
     objects.append(object_metadata)
-    logger.debug(f"Exporting Evo object '{object_metadata.object_id}' to AGSI file '{args.filename}'")
+    logger.debug(f"Exporting Evo object '{object_metadata.object_id}' to AGSi package '{args.filename}'")
 
 export_agsi(
     args.filename,

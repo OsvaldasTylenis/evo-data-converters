@@ -9,10 +9,17 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
-from .evo_to_agsi import (
-    UnsupportedObjectError,
-    export_blocksync_agsi,
-    export_agsi,
-)
+from .errors import AGSIExporterException, UnsupportedObjectError, UnsupportedSectionGeometryError
+from .evo_to_agsi import export_agsi, export_blocksync_agsi
+from .geological_sections import AgsiExport, SectionsSource, build_agsi_export
 
-__all__ = ["UnsupportedObjectError", "export_blocksync_agsi", "export_agsi"]
+__all__ = [
+    "AGSIExporterException",
+    "AgsiExport",
+    "SectionsSource",
+    "UnsupportedObjectError",
+    "UnsupportedSectionGeometryError",
+    "build_agsi_export",
+    "export_agsi",
+    "export_blocksync_agsi",
+]
