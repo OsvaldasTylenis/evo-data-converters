@@ -16,7 +16,12 @@ geometry files into numpy arrays. Other AGSi versions (e.g. pre-1.0 v0.6) are re
 :class:`AGSIUnsupportedVersionError`.
 """
 
-from .errors import AGSIDataFileIOError, AGSIInvalidDataError, AGSIUnsupportedVersionError
+from .errors import (
+    AGSIDataFileIOError,
+    AGSIInvalidDataError,
+    AGSIUnsupportedGeometryError,
+    AGSIUnsupportedVersionError,
+)
 from .geometry_files import (
     GeometryData,
     GeometryFileFormat,
@@ -54,6 +59,7 @@ __all__ = [
     "SUPPORTED_VERSIONS",
     "AGSIDataFileIOError",
     "AGSIInvalidDataError",
+    "AGSIUnsupportedGeometryError",
     "AGSIUnsupportedVersionError",
     "AgsFile",
     "AgsProject",

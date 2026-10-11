@@ -29,8 +29,8 @@ Evo is powered by Seequent, a Bentley organisation.
 Converts [AGSi](https://ags-data-format-wg.gitlab.io/agsi/agsi_standard/latest/) ground models
 to and from Evo `geological-sections` objects.
 
-> **Status:** work in progress. This release contains the AGSi **reader** only;
-> `convert_agsi` (import) and `export_agsi` (export) still raise `NotImplementedError`.
+> **Status:** work in progress. This release contains the AGSi **reader** and the 2D **section
+> geometry engine**; `convert_agsi` (import) and `export_agsi` (export) still raise `NotImplementedError`.
 
 ### Reading AGSi packages
 
@@ -66,7 +66,9 @@ I/O problems raise `AGSIDataFileIOError`. Malformed documents raise `AGSIInvalid
 #### Supported AGSi versions
 
 Only **AGSi 1.0.x** is supported, read as-is with no normalisation. The version is taken from
-`agsSchema.version`, and any version declared in `index.json` must also be 1.0.x. Other versions,
+`agsSchema.version`, and any version declared in `index.json` must also be 1.0.x. Versions must be
+written in full as `1.0.<patch>` (e.g. `1.0.0`, `1.0.1`); `1.0`, `1.0.`, `1.0.1.2`, prerelease
+suffixes and surrounding whitespace are rejected. Other versions,
 including the pre-1.0 AGSi v0.6 format (no `agsSchema`), raise `AGSIUnsupportedVersionError`
 (a subclass of `AGSIInvalidDataError`).
 
@@ -100,7 +102,57 @@ The reader tolerates quirks found in published examples:
 * A `fileURI` that is not found exactly is matched case-insensitively (with a warning).
 * Numbers split over two lines in Mathematica's "exponent above" style are repaired.
 
-URIs that point outside the package are rejected.
+URIs that point outside the package are rejected, as is an `index.json` `filePath` that does
+(absolute, drive, UNC or URL paths, and `..` segments that leave the folder holding `index.json`,
+including percent-encoded ones). For extracted folders, the resolved path of each file read must
+also stay inside the package folder, so symlinks and junctions cannot point outside it. DXF arcs (`ARC`, polyline bulges) and other
+unsupported entities are not converted; they are counted in `GeometryData.curved_segments` and
+`GeometryData.skipped_entities`.
+
+### Section geometry
+
+`evo.data_converters.agsi.geometry` turns a 2D section model (`agsiGeometryAreaFromLines`
+elements) into section-plane geometry for Evo `geological-sections`. It does not publish
+anything yet.
+
+```python
+from evo.data_converters.agsi.geometry import build_model_section
+
+section = build_model_section(package, package.models[0], base_elevation=-100.0)
+frame, geometry = section.frame, section.geometry
+frame.origin, frame.rotation           # world point at chainage 0, Evo rotation of the section plane
+geometry.vertices, geometry.chunks     # (u, v) = (chainage, elevation) vertices; [offset, count] chunks
+for volume in geometry.volumes:        # one or more closed polygons per element
+    ring = geometry.ring(volume)
+for line in geometry.lines:            # each top/bottom profile once, shared by the units above and below
+    line.top_of, line.bottom_of, line.generated
+frame.section_to_world(geometry.vertices)  # world x, y, z
+```
+
+* **Alignment.** The section frame comes from the `agsiModelAlignment` referenced by the
+  model's `alignmentID`; without one, chainage is used as a local x axis (`SectionFrame.local()`),
+  and you can pass `frame=` explicitly to override the placement. A linked alignment is still
+  checked, so `frame=` cannot be used to accept a curved one. Only **straight** alignments are supported. Consecutive
+  vertices or connected DXF `LINE`s are merged only when they are *exactly* collinear (exact
+  arithmetic on the stored decimal values, no tolerance). Curved, kinked, closed, branched or
+  disconnected alignments and DXF arcs raise `AGSIUnsupportedGeometryError` (or
+  `AGSIInvalidDataError` for broken data). Nothing is smoothed or simplified.
+* **Profiles** must be 2D (chainage, elevation). Duplicate vertices are dropped and profiles
+  drawn right to left are reversed; vertical steps and overhangs (chainage not strictly
+  increasing) are rejected. Profiles that run past the end of the alignment are only logged.
+* **Units.** A unit's top and bottom must cover the same chainage range. Where they coincide
+  (pinch-out) the unit is split into separate polygons; a unit with zero thickness everywhere has
+  no polygon. A top below its bottom raises `AGSIInvalidDataError`, checked exactly. Pinch-out
+  splitting needs top and bottom to share their chainage sampling; otherwise one polygon is made,
+  and it may touch itself.
+* **Shared contacts.** Identical profiles (such as the base of one unit and the top of the next)
+  are stored once and split at the same chainages, so neighbouring polygons share their
+  boundaries exactly.
+* **Missing top or bottom.** AGSi lets a unit have a top only (it extends down to the next
+  surface). Here, a missing bottom becomes a horizontal line at `base_elevation`, or the model
+  boundary's `bottomElevation`. A missing top uses `top_elevation` or `topElevation`. If neither
+  is given, `AGSIInvalidDataError` is raised. Overlaps with lower units are not trimmed.
+* DXF `LINE` end points are joined by the reader within 1e-9 before the exact checks.
 
 ### Tests
 
@@ -112,7 +164,9 @@ The committed fixtures under `tests/data/` are small AGSi 1.0.1 excerpts of the 
 examples. The examples published on the AGSi website are AGSi v0.6, which is not supported. To
 also run the integration tests (not committed; up to 80 MB), set `AGSI_SAMPLE_DIR` to a folder
 containing AGSi 1.0.1 conversions of them, named like the originals (`Silvertown2D_{wkt,dxf}_{1,3}.agsi`
-and `Silvertown3D_{wkt,dxf,stl}.agsi`).
+and `Silvertown3D_{wkt,dxf,stl}.agsi`). Their NB/SB alignments are curved, so the geometry tests
+check that they are rejected; an optional `Silvertown2D_wkt_straight_synthetic.agsi` in the same
+folder (the same units on a straight alignment) is built end to end.
 
 
 ## Code of conduct

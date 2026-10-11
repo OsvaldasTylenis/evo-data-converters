@@ -20,3 +20,7 @@ class AGSIDataFileIOError(Exception):
 
 class AGSIUnsupportedVersionError(AGSIInvalidDataError):
     """Raised when an AGSi document is not AGSi 1.0.x (e.g. a pre-1.0 v0.6 document)."""
+
+
+class AGSIUnsupportedGeometryError(AGSIInvalidDataError):
+    """Raised when AGSi geometry is valid but not supported by the converter (e.g. a curved alignment)."""

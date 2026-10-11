@@ -92,6 +92,10 @@ class GeometryData:
     per polygon (exterior first, closing vertex retained). ``mesh`` is populated for triangle
     data: DXF 3DFACE / polyface meshes, STL, and WKT collections made only of 3D triangles
     (TINs), which are not repeated in ``polygons``.
+
+    ``curved_segments`` counts DXF polyline segments with a bulge (arc), which ``lines`` holds as
+    straight chords between vertices. ``skipped_entities`` counts DXF entities that could not be
+    read (e.g. ``ARC``, ``SPLINE``), by entity type. Both are empty for other formats.
     """
 
     source_format: GeometryFileFormat
@@ -100,6 +104,8 @@ class GeometryData:
     points: list[FloatArray] = field(default_factory=list)
     mesh: Optional[TriangleMesh] = None
     srid: Optional[int] = None
+    curved_segments: int = 0
+    skipped_entities: dict[str, int] = field(default_factory=dict)
 
     @property
     def dimension(self) -> int:
@@ -350,7 +356,9 @@ def parse_dxf(data: bytes, layer: Optional[str] = None, drop_zero_z: bool = True
     """Parse DXF entities into :class:`GeometryData`.
 
     Supported: LINE (joined into polylines), LWPOLYLINE, 2D/3D POLYLINE, polyface POLYLINE,
-    3DFACE and POINT. Other entity types are skipped with a warning.
+    3DFACE and POINT. Other entity types are skipped with a warning and counted in
+    ``skipped_entities``. Polyline arc segments (bulges) are read as straight chords and counted
+    in ``curved_segments``.
 
     ASCII DXF files that only contain LINE, 3DFACE and POINT entities (typical of exported
     sections and TIN surfaces) are read with a fast tag scanner; anything else is read with
@@ -388,7 +396,14 @@ def parse_dxf(data: bytes, layer: Optional[str] = None, drop_zero_z: bool = True
             lines = [a[:, :2].copy() for a in lines]
             points = [a[:, :2].copy() for a in points]
 
-    return GeometryData(source_format=GeometryFileFormat.DXF, lines=lines, points=points, mesh=mesh)
+    return GeometryData(
+        source_format=GeometryFileFormat.DXF,
+        lines=lines,
+        points=points,
+        mesh=mesh,
+        curved_segments=entities.curved_segments,
+        skipped_entities=entities.skipped,
+    )
 
 
 @dataclass
@@ -398,6 +413,8 @@ class _DxfEntities:
     points: list[tuple[float, float, float]] = field(default_factory=list)
     quads: list[tuple[float, ...]] = field(default_factory=list)
     triangles: list[FloatArray] = field(default_factory=list)
+    curved_segments: int = 0
+    skipped: dict[str, int] = field(default_factory=dict)
 
 
 # Entity types handled by the fast reader, with their number of vertices (group codes 1x/2x/3x).
@@ -471,7 +488,7 @@ def _read_dxf_with_ezdxf(data: bytes, layer_key: Optional[str]) -> _DxfEntities:
         raise AGSIInvalidDataError(f"Invalid DXF: {e}") from e
 
     out = _DxfEntities()
-    skipped: dict[str, int] = {}
+    skipped = out.skipped
     for entity in doc.modelspace():
         if layer_key is not None and str(entity.dxf.layer).casefold() != layer_key:
             continue
@@ -482,11 +499,15 @@ def _read_dxf_with_ezdxf(data: bytes, layer_key: Optional[str]) -> _DxfEntities:
             xy = np.array([(p[0], p[1]) for p in entity.get_points("xy")], dtype=np.float64).reshape(-1, 2)
             line = np.column_stack([xy, np.full(len(xy), elevation)])
             out.lines.append(_close_ring(line) if entity.closed else line)
+            bulges = [float(p[0]) for p in entity.get_points("b")]
+            out.curved_segments += _bulged_segments(bulges, bool(entity.closed))
         elif isinstance(entity, Polyface):
             out.triangles.extend(_polyface_triangles(entity))
         elif isinstance(entity, Polyline) and (entity.is_2d_polyline or entity.is_3d_polyline):
             line = np.array([tuple(v.dxf.location) for v in entity.vertices], dtype=np.float64).reshape(-1, 3)
             out.lines.append(_close_ring(line) if entity.is_closed else line)
+            bulges = [float(v.dxf.get("bulge", 0.0)) for v in entity.vertices]
+            out.curved_segments += _bulged_segments(bulges, bool(entity.is_closed))
         elif isinstance(entity, Face3d):
             out.quads.append(tuple(c for i in range(4) for c in entity.dxf.get(f"vtx{i}")))
         elif isinstance(entity, Point):
@@ -497,6 +518,11 @@ def _read_dxf_with_ezdxf(data: bytes, layer_key: Optional[str]) -> _DxfEntities:
     if skipped:
         logger.warning(f"DXF: skipped unsupported entities {skipped}.")
     return out
+
+
+def _bulged_segments(bulges: list[float], closed: bool) -> int:
+    """Number of arc segments; a vertex bulge applies to the segment that starts at the vertex."""
+    return sum(1 for bulge in (bulges if closed else bulges[:-1]) if bulge)
 
 
 def _close_ring(line: FloatArray) -> FloatArray:

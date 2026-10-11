@@ -10,6 +10,8 @@
 #  limitations under the License.
 
 import json
+import shutil
+import sys
 import zipfile
 from pathlib import Path
 from typing import Any
@@ -18,6 +20,7 @@ import numpy as np
 import pytest
 from conftest import zip_folder
 
+import evo.data_converters.agsi.reader.package as package_module
 from evo.data_converters.agsi.reader import (
     AGSIDataFileIOError,
     AGSIInvalidDataError,
@@ -173,13 +176,59 @@ class TestSectionAlignment:
 
 
 class TestVersions:
-    @pytest.mark.parametrize("version", ["1.0", "1.0.0", "1.0.1", " 1.0.2 "])
+    @pytest.mark.parametrize("version", ["1.0.0", "1.0.1", "1.0.2", "1.0.10"])
     def test_supported(self, version: str) -> None:
         assert is_supported_version(version)
 
-    @pytest.mark.parametrize("version", ["0.6", "1.1.0", "2.0.0", "1.0.1-beta", "v1.0.1", "", None, 1.0])
+    @pytest.mark.parametrize(
+        "version",
+        [
+            "1.0",
+            "1.0.",
+            "1.0.1.2",
+            "1.0.01",
+            " 1.0.1",
+            "1.0.1 ",
+            "1.0.1-beta",
+            "1.0.1rc1",
+            "1.0.1+build",
+            "1.0.x",
+            "1.0.١",  # non-ASCII digit
+            "v1.0.1",
+            "0.6",
+            "1.1.0",
+            "2.0.0",
+            "",
+            None,
+            1.0,
+        ],
+    )
     def test_unsupported(self, version: Any) -> None:
         assert not is_supported_version(version)
+
+    @pytest.mark.parametrize("version", ["1.0", "1.0.", "1.0.1.2", "1.0.1-beta"])
+    def test_malformed_schema_version_rejected(self, tmp_path: Path, version: str) -> None:
+        path = tmp_path / "main.json"
+        path.write_text(json.dumps({"agsSchema": {"name": "AGSi", "version": version}, "agsiModel": []}))
+        with pytest.raises(AGSIUnsupportedVersionError, match="agsSchema.version"):
+            AgsiPackage.open(path)
+
+    def test_malformed_index_version_rejected(self, tmp_path: Path) -> None:
+        path = _write_zip(
+            tmp_path / "x.agsi",
+            {
+                "index.json": {"agsiIndex": {"filePath": "main.json", "schemaVersion": "1.0"}},
+                "main.json": {"agsSchema": V101_SCHEMA, "agsiModel": []},
+            },
+        )
+        with pytest.raises(AGSIUnsupportedVersionError, match="index.json schemaVersion"):
+            AgsiPackage.open(path)
+
+    @pytest.mark.parametrize("version", ["1.0.0", "1.0.1"])
+    def test_supported_schema_version_accepted(self, tmp_path: Path, version: str) -> None:
+        path = tmp_path / "main.json"
+        path.write_text(json.dumps({"agsSchema": {"name": "AGSi", "version": version}, "agsiModel": []}))
+        assert AgsiPackage.open(path).schema_version == version
 
     def test_v06_package_rejected(self, tmp_path: Path) -> None:
         path = _write_zip(
@@ -286,6 +335,143 @@ class TestFileResolution:
         package = AgsiPackage.open(wkt_dir)
         with pytest.raises(AGSIDataFileIOError, match="not found"):
             package.read_bytes("Profiles/does-not-exist.txt")
+
+    @pytest.mark.parametrize("uri", ["%2E%2E/outside.txt", "%2Fabs.txt", "C%3A/a.txt", "C:a.txt", "\\\\server\\a.txt"])
+    def test_rejects_encoded_and_windows_uris(self, wkt_zip: Path, uri: str) -> None:
+        with pytest.raises(AGSIDataFileIOError):
+            AgsiPackage.open(wkt_zip).resolve_uri(uri)
+
+    def test_linked_geometry_outside_folder_not_read(self, wkt_dir: Path, tmp_path: Path) -> None:
+        folder = Path(shutil.copytree(wkt_dir, tmp_path / "pkg"))
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "secret.txt").write_text("LINESTRING (0 0, 1 1)")
+        _link_directory(folder / "Linked", outside)
+        with pytest.raises(AGSIDataFileIOError, match="outside the AGSi package root"):
+            package_module._contained_path(folder, "Linked/secret.txt")
+        # Whether or not the file listing descends into the link (Python-version dependent), it is never read.
+        with pytest.raises(AGSIDataFileIOError, match="outside the AGSi package root|not found"):
+            AgsiPackage.open(folder).read_bytes("Linked/secret.txt")
+
+
+def _link_directory(link: Path, target: Path) -> None:
+    """Symlink ``link`` to the ``target`` folder, or create an NTFS junction where symlinks need privileges."""
+    try:
+        link.symlink_to(target, target_is_directory=True)
+        return
+    except OSError:
+        if sys.platform != "win32":
+            pytest.skip("Directory links are not available")
+        else:
+            import _winapi
+
+            _winapi.CreateJunction(str(target), str(link))
+
+
+SECRET_DOCUMENT = {"agsSchema": V101_SCHEMA, "agsiModel": [{"modelID": "secret"}]}
+TRAVERSAL_PATHS = [
+    "../secret.json",
+    "sub/../../secret.json",
+    "./sub/../../secret.json",
+    "..\\secret.json",
+    "%2E%2E/secret.json",
+    "%2E%2E%2Fsecret.json",
+    "..",
+    ".",
+]
+ABSOLUTE_PATHS = [
+    "/secret.json",
+    "\\secret.json",
+    "C:/secret.json",
+    "C:\\secret.json",
+    "C:secret.json",
+    "C%3A/secret.json",
+    "%2Fsecret.json",
+    "\\\\server\\share\\secret.json",
+    "//server/share/secret.json",
+    "file:///secret.json",
+    "http://example.com/secret.json",
+]
+
+
+class TestIndexFilePath:
+    """``index.json`` ``filePath`` must stay inside the package root (the folder holding index.json)."""
+
+    @pytest.fixture
+    def reads(self, monkeypatch: pytest.MonkeyPatch) -> list[Path]:
+        """Paths read through the package's file reader."""
+        recorded: list[Path] = []
+        original = package_module._read_file
+
+        def read_file(path: Path) -> bytes:
+            recorded.append(path)
+            data: bytes = original(path)
+            return data
+
+        monkeypatch.setattr(package_module, "_read_file", read_file)
+        return recorded
+
+    def _folder(self, tmp_path: Path, file_path: str) -> Path:
+        """A package folder ``tmp_path/pkg`` whose index points at ``file_path``; a valid AGSi file sits outside."""
+        (tmp_path / "secret.json").write_text(json.dumps(SECRET_DOCUMENT))
+        folder = tmp_path / "pkg"
+        (folder / "sub").mkdir(parents=True)
+        (folder / "index.json").write_text(json.dumps({"agsiIndex": {"filePath": file_path}}))
+        return folder
+
+    @pytest.mark.parametrize("file_path", TRAVERSAL_PATHS + ABSOLUTE_PATHS)
+    @pytest.mark.parametrize("via_index_file", [False, True])
+    def test_folder_rejects(self, tmp_path: Path, reads: list[Path], file_path: str, via_index_file: bool) -> None:
+        folder = self._folder(tmp_path, file_path)
+        with pytest.raises(AGSIDataFileIOError, match="outside the AGSi package|not a relative path"):
+            AgsiPackage.open(folder / "index.json" if via_index_file else folder)
+        assert reads == []
+
+    @pytest.mark.parametrize("file_path", TRAVERSAL_PATHS + ABSOLUTE_PATHS)
+    @pytest.mark.parametrize("index_name", ["index.json", "package/index.json", "a/b/index.json"])
+    def test_zip_rejects(self, tmp_path: Path, file_path: str, index_name: str) -> None:
+        members: dict[str, object] = {index_name: {"agsiIndex": {"filePath": file_path}}}
+        for name in ("secret.json", "package/secret.json", "a/secret.json", "server/share/secret.json"):
+            members[name] = SECRET_DOCUMENT
+        path = _write_zip(tmp_path / "x.agsi", members)
+        with pytest.raises(AGSIDataFileIOError, match="outside the AGSi package|not a relative path"):
+            AgsiPackage.open(path)
+
+    def test_linked_main_file_outside_folder_not_read(self, tmp_path: Path, reads: list[Path]) -> None:
+        folder = self._folder(tmp_path, "Linked/secret.json")
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        shutil.copy(tmp_path / "secret.json", outside / "secret.json")
+        _link_directory(folder / "Linked", outside)
+        with pytest.raises(AGSIDataFileIOError, match="outside the AGSi package root"):
+            AgsiPackage.open(folder)
+        assert reads == []
+
+    @pytest.mark.parametrize("file_path", ["Model/main.json", "./Model/main.json", "Model/../Model/main.json"])
+    def test_nested_main_file_in_folder(self, tmp_path: Path, file_path: str) -> None:
+        folder = self._folder(tmp_path, file_path)
+        (folder / "Model").mkdir()
+        (folder / "Model" / "main.json").write_text(json.dumps({"agsSchema": V101_SCHEMA, "agsiModel": []}))
+        (folder / "Model" / "line.txt").write_text("LINESTRING (0 0, 3 3)")
+        for path in (folder, folder / "index.json"):
+            package = AgsiPackage.open(path)
+            assert package.main_file == "Model/main.json"
+            assert package.read_geometry("line.txt").lines[0][-1, 0] == 3
+
+    @pytest.mark.parametrize("file_path", ["Model/main.json", "Model/../Model/main.json", "Model%2Fmain.json"])
+    def test_nested_index_and_main_file_in_zip(self, tmp_path: Path, file_path: str) -> None:
+        path = _write_zip(
+            tmp_path / "x.agsi",
+            {
+                "package/index.json": {"agsiIndex": {"filePath": file_path, "schemaVersion": "1.0.1"}},
+                "package/Model/main.json": {"agsSchema": V101_SCHEMA, "agsiModel": []},
+                "package/Model/line.txt": "LINESTRING (0 0, 3 3)",
+                "secret.json": SECRET_DOCUMENT,
+            },
+        )
+        package = AgsiPackage.open(path)
+        assert package.main_file == "package/Model/main.json"
+        assert package.read_geometry("line.txt").lines[0][-1, 0] == 3
 
 
 class TestErrors:

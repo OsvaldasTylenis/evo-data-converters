@@ -13,6 +13,7 @@
 
 import json
 import posixpath
+import re
 import zipfile
 from pathlib import Path
 from typing import Any, Optional, Union
@@ -30,6 +31,7 @@ from .versions import detect_version
 logger = evo.logging.getLogger("data_converters")
 
 INDEX_FILE_NAME = "index.json"
+_DRIVE = re.compile(r"[A-Za-z]:")
 
 
 class AgsiPackage:
@@ -68,7 +70,7 @@ class AgsiPackage:
 
         self.schema_version = detect_version(raw, self.index, name=str(path))
         index_version = self.index.get("schemaVersion")
-        if index_version is not None and str(index_version).strip() != self.schema_version:
+        if index_version is not None and index_version != self.schema_version:
             self._warn(
                 f"index.json schemaVersion '{index_version}' differs from agsSchema.version '{self.schema_version}'."
             )
@@ -98,7 +100,8 @@ class AgsiPackage:
         if path.name.lower() == INDEX_FILE_NAME:
             index = _read_index(path.read_bytes(), str(path))
             main_file = _main_file_from_index(index, str(path))
-            return cls(path, root, main_file, _read_json(_read_file(root / main_file), main_file), index)
+            main_path = _contained_path(root, main_file)
+            return cls(path, root, main_file, _read_json(_read_file(main_path), main_file), index)
         index_path = root / INDEX_FILE_NAME
         sibling_index = _read_index(index_path.read_bytes(), str(index_path)) if index_path.is_file() else None
         return cls(path, root, path.name, _read_json(_read_file(path), str(path)), sibling_index)
@@ -109,7 +112,8 @@ class AgsiPackage:
         if index_path.is_file():
             index = _read_index(index_path.read_bytes(), str(index_path))
             main_file = _main_file_from_index(index, str(index_path))
-            return cls(path, path, main_file, _read_json(_read_file(path / main_file), main_file), index)
+            main_path = _contained_path(path, main_file)
+            return cls(path, path, main_file, _read_json(_read_file(main_path), main_file), index)
         for candidate in sorted(path.glob("*.json")):
             document = _try_read_agsi_json(candidate.read_bytes())
             if document is not None:
@@ -180,7 +184,7 @@ class AgsiPackage:
         base = posixpath.dirname(self.main_file)
         candidates = [posixpath.normpath(posixpath.join(base, relative))] if base else []
         candidates.append(posixpath.normpath(relative))
-        candidates = [c for c in dict.fromkeys(candidates) if c != ".." and not c.startswith("../")]
+        candidates = [c for c in dict.fromkeys(candidates) if not _escapes(c)]
         if not candidates:
             raise AGSIDataFileIOError(f"fileURI '{uri}' points outside the AGSi package.")
 
@@ -204,7 +208,7 @@ class AgsiPackage:
                     return archive.read(name)
             except (zipfile.BadZipFile, OSError, KeyError) as e:
                 raise AGSIDataFileIOError(f"Unable to read '{name}' from {self.path}: {e}") from e
-        return _read_file(self.root / name)
+        return _read_file(_contained_path(self.root, name))
 
     def read_geometry(self, geometry: Union[AgsiGeometryFromFile, str]) -> GeometryData:
         """Read and parse a geometry file referenced by an ``agsiGeometryFromFile`` (or a URI)."""
@@ -266,18 +270,51 @@ def _read_index(data: bytes, name: str) -> dict[str, Any]:
 
 
 def _main_file_from_index(index: dict[str, Any], name: str) -> str:
+    """The main file named by ``index.json`` ``filePath``, relative to the package root (the index's folder)."""
     file_path = index.get("filePath")
     if not isinstance(file_path, str) or not file_path:
         raise AGSIInvalidDataError(f"{name}: index.json has no 'filePath'.")
-    return _relative_path_from_uri(file_path)
+    relative = posixpath.normpath(_relative_path_from_uri(file_path, "index.json filePath"))
+    if _escapes(relative):
+        raise AGSIDataFileIOError(f"{name}: index.json filePath '{file_path}' points outside the AGSi package.")
+    return relative
 
 
-def _relative_path_from_uri(uri: str) -> str:
+def _relative_path_from_uri(uri: str, what: str = "fileURI") -> str:
+    """Decode a relative URI to a POSIX path, rejecting absolute, drive, UNC and scheme-qualified paths.
+
+    The result may still contain ``..`` segments; callers check it stays within the package.
+    """
     parsed = urlparse(uri)
+    path = unquote(parsed.path).replace("\\", "/")
     # A single letter scheme is a Windows drive (e.g. "C:/..."), which is equally not allowed.
-    if parsed.scheme or parsed.netloc or uri.startswith(("/", "\\")):
-        raise AGSIDataFileIOError(f"fileURI '{uri}' is not a relative path within the AGSi package.")
-    return unquote(parsed.path).replace("\\", "/")
+    # Checks are repeated after decoding so that e.g. "%2Fetc" or "C%3A/x" cannot slip through.
+    if (
+        parsed.scheme
+        or parsed.netloc
+        or uri.startswith(("/", "\\"))
+        or path.startswith("/")
+        or _DRIVE.match(path)
+        or "\x00" in path
+    ):
+        raise AGSIDataFileIOError(f"{what} '{uri}' is not a relative path within the AGSi package.")
+    return path
+
+
+def _escapes(normalized: str) -> bool:
+    return normalized in ("", ".", "..") or normalized.startswith("../")
+
+
+def _contained_path(root: Path, relative: str) -> Path:
+    """``root / relative``, checking that the resolved path (following symlinks) stays inside ``root``."""
+    path = root / relative
+    try:
+        resolved, resolved_root = path.resolve(), root.resolve()
+    except (OSError, RuntimeError) as e:
+        raise AGSIDataFileIOError(f"Unable to resolve {path}: {e}") from e
+    if not resolved.is_relative_to(resolved_root):
+        raise AGSIDataFileIOError(f"'{relative}' resolves outside the AGSi package root {root}.")
+    return path
 
 
 def _find_name(names: list[str], wanted: str) -> Optional[str]:

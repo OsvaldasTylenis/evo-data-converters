@@ -199,6 +199,19 @@ class TestDxf:
             result = parse_dxf(_dxf_bytes(doc))
         assert len(result.lines) == 1
         assert "CIRCLE" in caplog.text
+        assert result.skipped_entities == {"CIRCLE": 1}
+
+    def test_polyline_bulges_are_counted(self) -> None:
+        doc = ezdxf.new()
+        msp = doc.modelspace()
+        msp.add_lwpolyline([(0, 0, 0.5), (1, 0, 0), (2, 0, 0.3)], format="xyb")
+        polyline = msp.add_polyline2d([(0, 0), (1, 0), (2, 0)], close=True)
+        polyline.vertices[2].dxf.bulge = 0.2
+        result = parse_dxf(_dxf_bytes(doc))
+        # The LWPOLYLINE's last bulge is unused as it is open; the closed POLYLINE's last one closes the ring.
+        assert result.curved_segments == 2
+        assert result.skipped_entities == {}
+        assert parse_dxf(_dxf_bytes(ezdxf.new())).curved_segments == 0
 
     def test_invalid(self) -> None:
         with pytest.raises(AGSIInvalidDataError):
