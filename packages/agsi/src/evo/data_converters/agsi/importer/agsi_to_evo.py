@@ -41,10 +41,12 @@ def convert_agsi(
     overwrite_existing_objects: bool = False,
     *,
     coordinate_reference_system: str | int | None = None,
+    top_elevation: Optional[float] = None,
+    base_elevation: Optional[float] = None,
 ) -> list[BaseSpatialDataProperties_V1_0_1 | ObjectMetadata]:
-    """Converts a AGSI file into Geoscience Objects.
+    """Converts the 2D section models of an AGSi 1.0.x package into Evo ``geological-sections`` objects.
 
-    :param filepath: Path to the AGSI file.
+    :param filepath: Path to the ``.agsi`` package, extracted folder, or main AGSi JSON file.
     :param epsg_code: (Optional, deprecated) Integer EPSG code for the coordinate reference system. Use ``coordinate_reference_system`` instead.
     :param evo_workspace_metadata: (Optional) Evo workspace metadata.
     :param service_manager_widget: (Optional) Service Manager Widget for use in jupyter notebooks.
@@ -53,6 +55,9 @@ def convert_agsi(
     :param publish_objects: (Optional) Set False to return rather than publish objects.
     :param overwrite_existing_objects: (Optional) Set True to overwrite any existing object at the upload_path.
     :param coordinate_reference_system: (Optional) Coordinate reference system: an integer or string EPSG code (e.g. ``2193`` or ``"EPSG:2193"``), an OGC WKT string, or ``None`` for unspecified.
+        The ``globalXYSystem`` declared in the AGSi file is not applied automatically.
+    :param top_elevation: (Optional) Top of units without a top profile. Defaults to the model boundary ``topElevation``.
+    :param base_elevation: (Optional) Base of units without a bottom profile. Defaults to the model boundary ``bottomElevation``.
 
     Both epsg_code and coordinate_reference_system can't be provided, otherwise a ValueError will be raised. If neither is provided, the CRS will be set to "unspecified".
 
@@ -62,12 +67,14 @@ def convert_agsi(
     - evo_workspace_metadata.hub_url is present, or
     - service_manager_widget was passed to this function.
 
-    :return: List of Geoscience Objects, or list of ObjectMetadata if published.
+    :return: List of Geoscience Objects (one ``GeologicalSections_V1_2_0`` per section model), or list of ObjectMetadata if published.
 
     :raise MissingConnectionDetailsError: If no connections details could be derived.
     :raise ConflictingConnectionDetailsError: If both evo_workspace_metadata and service_manager_widget present.
     :raise AGSIDataFileIOError: If the AGSI file could not be opened or read.
-    :raise AGSIInvalidDataError: If an error was detected in the AGSI file.
+    :raise AGSIInvalidDataError: If an error was detected in the AGSI file, or a required elevation is missing.
+    :raise AGSIUnsupportedVersionError: If the file is not AGSi 1.0.x.
+    :raise AGSIUnsupportedGeometryError: If the file has no 2D section model, or an alignment is not straight.
     """
 
     object_service_client, data_client = create_evo_object_service_and_data_client(
@@ -84,7 +91,10 @@ def convert_agsi(
     else:
         crs = crs_from_any(coordinate_reference_system)
 
-    geoscience_objects = [utils.get_geoscience_object_from_agsi(data_client, filepath, crs, tags)]
+    result = utils.get_geoscience_object_from_agsi(
+        data_client, filepath, crs, tags, top_elevation=top_elevation, base_elevation=base_elevation
+    )
+    geoscience_objects = list(result) if isinstance(result, list) else [result]
     objects_metadata = None
     if publish_objects:
         logger.debug("Publishing Geoscience Objects")

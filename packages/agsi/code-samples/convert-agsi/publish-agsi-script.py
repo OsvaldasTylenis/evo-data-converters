@@ -28,6 +28,17 @@ parser.add_argument(
 parser.add_argument("--upload-path", help="Path to upload objects to.")
 
 parser.add_argument(
+    "--base-elevation",
+    type=float,
+    help="Base elevation of units without a bottom profile. Defaults to the model boundary bottomElevation.",
+)
+parser.add_argument(
+    "--top-elevation",
+    type=float,
+    help="Top elevation of units without a top profile. Defaults to the model boundary topElevation.",
+)
+
+parser.add_argument(
     "--overwrite-existing-objects", action="store_true", default=False, help="Overwrite existing objects"
 )
 
@@ -117,8 +128,10 @@ results = convert_agsi(
     upload_path=args.upload_path,
     overwrite_existing_objects=args.overwrite_existing_objects,
     publish_objects=args.publish,
+    top_elevation=args.top_elevation,
+    base_elevation=args.base_elevation,
 )
 
-# Results will either be a list of BaseSpatialDataProperties_V1_0_1 if not published, or a list of ObjectMetadata if they were published
+# Results will either be a list of geological-sections objects if not published, or a list of ObjectMetadata if they were published
 for result in results:
     pprint.pp(result, indent=1)

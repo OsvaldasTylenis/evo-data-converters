@@ -29,8 +29,53 @@ Evo is powered by Seequent, a Bentley organisation.
 Converts [AGSi](https://ags-data-format-wg.gitlab.io/agsi/agsi_standard/latest/) ground models
 to and from Evo `geological-sections` objects.
 
-> **Status:** work in progress. This release contains the AGSi **reader** and the 2D **section
-> geometry engine**; `convert_agsi` (import) and `export_agsi` (export) still raise `NotImplementedError`.
+> **Status:** work in progress. This release contains the AGSi **reader**, the 2D **section
+> geometry engine** and the **importer** (`convert_agsi`) for straight 2D sections;
+> `export_agsi` (export) still raises `NotImplementedError`.
+
+### Importing AGSi into Evo
+
+`convert_agsi` converts each 2D section model of an AGSi 1.0.x package (a model with
+`agsiGeometryAreaFromLines` elements) into one Evo `geological-sections` object
+(`GeologicalSections_V1_2_0`) and publishes it, or returns it with `publish_objects=False`.
+
+```python
+from evo.data_converters.agsi import convert_agsi
+
+objects = convert_agsi(
+    "Silvertown2D_wkt_straight_synthetic.agsi",
+    evo_workspace_metadata=workspace_metadata,  # or service_manager_widget=...
+    coordinate_reference_system="EPSG:27700",
+    base_elevation=-100.0,  # base of the lowest unit, which has a top profile only
+    upload_path="agsi",
+)
+```
+
+* **CRS.** The `globalXYSystem` declared in the AGSi file is never applied automatically, because
+  it may be inferred rather than stated by the producer. Pass `coordinate_reference_system`; a
+  warning is logged when it is missing or differs from the declared EPSG code. Coordinate system
+  transformations (`transformShiftX`, ...) are not applied.
+* **Elevations.** `base_elevation` / `top_elevation` close units without a bottom / top profile;
+  they default to the model boundary's `bottomElevation` / `topElevation`.
+* **Errors.** Curved alignments, 3D profiles and files without a 2D section model raise
+  `AGSIUnsupportedGeometryError`; a missing required elevation or invalid data raise
+  `AGSIInvalidDataError`. Nothing is published when an error is raised.
+
+Object layout:
+
+| Evo | From AGSi |
+| --- | --- |
+| `name`, the single `sections[0]` and `folders[0]` | `modelName` (else `modelID`); the folder is named after the alignment |
+| `sections[0].origin`, `rotation` | the straight alignment at chainage 0 and elevation 0; vertical plane along the alignment |
+| `line_geometry` | (chainage, elevation) vertices and chunks; each profile is stored once |
+| `volumes` | one or more closed polygons per element, `feature` `OutputVolume`; `material_key` and `layer` are the `elementID`, `name` the `elementName` |
+| `surfaces` | one per distinct top/bottom line (`ContactSurface`); generated horizontal lines are `BoundarySurface` |
+| `materials`, `layer_order` | one per element (`colourRGB` or a default colour), top to bottom |
+| `volume_attributes` | `elementID`, `elementType`, and one attribute per `agsiDataParameterValue` code (and case); numeric values are continuous, others strings |
+| `extensions.agsi` | `schemaVersion`, `modelID`, `modelName`, `coordSystemID`, `alignmentID`, `alignmentName`, `startChainage`, `alignmentLength` |
+
+Models without section areas (plan models holding alignments, 3D models of surfaces) are skipped.
+`valueProfile` parameters are not converted.
 
 ### Reading AGSi packages
 
@@ -112,8 +157,7 @@ unsupported entities are not converted; they are counted in `GeometryData.curved
 ### Section geometry
 
 `evo.data_converters.agsi.geometry` turns a 2D section model (`agsiGeometryAreaFromLines`
-elements) into section-plane geometry for Evo `geological-sections`. It does not publish
-anything yet.
+elements) into section-plane geometry for Evo `geological-sections`; `convert_agsi` uses it.
 
 ```python
 from evo.data_converters.agsi.geometry import build_model_section
@@ -164,9 +208,14 @@ The committed fixtures under `tests/data/` are small AGSi 1.0.1 excerpts of the 
 examples. The examples published on the AGSi website are AGSi v0.6, which is not supported. To
 also run the integration tests (not committed; up to 80 MB), set `AGSI_SAMPLE_DIR` to a folder
 containing AGSi 1.0.1 conversions of them, named like the originals (`Silvertown2D_{wkt,dxf}_{1,3}.agsi`
-and `Silvertown3D_{wkt,dxf,stl}.agsi`). Their NB/SB alignments are curved, so the geometry tests
-check that they are rejected; an optional `Silvertown2D_wkt_straight_synthetic.agsi` in the same
-folder (the same units on a straight alignment) is built end to end.
+and `Silvertown3D_{wkt,dxf,stl}.agsi`). Their NB/SB alignments are curved, so the geometry and
+importer tests check that they are rejected (the 3D models are rejected for their 3D profiles); an
+optional `Silvertown2D_wkt_straight_synthetic.agsi` in the same folder (the same units on a
+straight alignment) is built and converted end to end.
+
+All tests are offline: the importer tests build the objects with a local data client that writes
+parquet files to a temporary folder, mock the Evo clients and publishing, and fail on any
+non-loopback network connection.
 
 
 ## Code of conduct
