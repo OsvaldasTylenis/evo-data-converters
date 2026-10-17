@@ -185,7 +185,8 @@ def build_section_geometry(
     below the bottom anywhere (tested exactly, without tolerance). Where top and bottom have the
     same vertex chainages, the unit is split into separate polygons wherever it pinches out to
     zero thickness, and a unit with zero thickness everywhere has no polygon. With different
-    vertex chainages a unit forms one polygon, which may touch itself where it pinches out.
+    vertex chainages a unit forms one polygon; its top and bottom may only meet at the ends of its
+    chainage range, never inside it (that would make a self-touching polygon).
 
     :param units: Units with their top and/or bottom lines in section coordinates.
     :param top_elevation: Elevation of the top of units without a top line (AGSi: the area
@@ -194,7 +195,8 @@ def build_section_geometry(
         extends downwards to the model boundary).
     :raise AGSIInvalidDataError: If a unit has neither line, its top is below its bottom, or it
         has no bottom (top) line and no ``base_elevation`` (``top_elevation``) is given.
-    :raise AGSIUnsupportedGeometryError: If the top and bottom of a unit span different chainages.
+    :raise AGSIUnsupportedGeometryError: If the top and bottom of a unit span different chainages,
+        or have different vertex chainages and meet inside the unit.
     """
     store = _LineStore()
     plans: list[_UnitPlan] = []
@@ -287,8 +289,15 @@ def _unit_lines(
 
 
 def _horizontal(line: FloatArray, elevation: float) -> FloatArray:
+    """A horizontal line at ``elevation`` over the chainages of ``line``.
+
+    It has only its two end vertices unless ``line`` touches it at an interior vertex; then it is
+    sampled at every chainage of ``line`` (exactly, as it is horizontal) so the unit can be split there.
+    """
     if not np.isfinite(elevation):
         raise AGSIInvalidDataError(f"Elevation must be finite, got {elevation}.")
+    if np.any(line[1:-1, 1] == elevation):
+        return np.column_stack([line[:, 0], np.full(len(line), elevation)]).astype(np.float64) + 0.0
     return np.array([[line[0, 0], elevation], [line[-1, 0], elevation]], dtype=np.float64) + 0.0
 
 
@@ -317,13 +326,28 @@ def _positive_runs(key: str, top: FloatArray, bottom: FloatArray) -> list[_Run]:
 
 
 def _check_above(key: str, top: FloatArray, bottom: FloatArray) -> bool:
-    """Exactly check that ``top`` is not below ``bottom``; return whether it is above anywhere."""
-    above = False
-    for sign in (*_signs_against(top, bottom), *(-s for s in _signs_against(bottom, top))):
-        if sign < 0:
-            raise AGSIInvalidDataError(f"Unit '{key}': top line crosses below the bottom line.")
-        above = above or sign > 0
-    return above
+    """Exactly check that ``top`` is not below ``bottom``; return whether it is above anywhere.
+
+    Lines with different vertex chainages cannot be split where they meet without inserting
+    vertices, so a unit whose top and bottom touch strictly inside its chainage range (which would
+    make a self-touching polygon) is rejected. The difference of two piecewise-linear lines has its
+    minimum at a vertex of either line, so testing the vertices finds every contact.
+    """
+    bottom_signs = _signs_against(top, bottom)
+    top_signs = [-s for s in _signs_against(bottom, top)]
+    if any(sign < 0 for sign in (*bottom_signs, *top_signs)):
+        raise AGSIInvalidDataError(f"Unit '{key}': top line crosses below the bottom line.")
+    if not any(sign > 0 for sign in (*bottom_signs, *top_signs)):
+        return False
+    interior = [(u, s) for u, s in zip(bottom[1:-1, 0], bottom_signs[1:-1]) if s == 0]
+    interior += [(u, s) for u, s in zip(top[1:-1, 0], top_signs[1:-1]) if s == 0]
+    if interior:
+        raise AGSIUnsupportedGeometryError(
+            f"Unit '{key}': top and bottom lines have different vertex chainages and meet at chainage "
+            f"{min(u for u, _ in interior)}, inside the unit; such a pinch-out would make a self-touching "
+            "polygon. Sample the top and bottom at the same chainages so the unit can be split there."
+        )
+    return True
 
 
 def _signs_against(line: FloatArray, points: FloatArray) -> list[int]:

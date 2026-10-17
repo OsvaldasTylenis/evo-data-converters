@@ -11,10 +11,17 @@
 
 """Map Evo ``geological-sections`` objects to AGSi 1.0.1 section models.
 
-Each Evo section becomes an AGSi model of ``agsiGeometryAreaFromLines`` elements, one element per
-Evo volume, linked by ``alignmentID`` to a straight two-point ``agsiModelAlignment`` held in a
-plan (XY) model. Section coordinates are written unchanged: chainage = u and elevation = v plus
-the elevation of the section origin.
+Each Evo section becomes an AGSi model of ``agsiGeometryAreaFromLines`` elements, linked by
+``alignmentID`` to a straight two-point ``agsiModelAlignment`` held in a plan (XY) model. Section
+coordinates are written unchanged: chainage = u and elevation = v plus the elevation of the
+section origin.
+
+An AGSi element whose unit pinches out is several Evo volumes (a polygon cannot be split into
+disconnected areas or touch itself). Objects created by the importer record which surface is the
+top and bottom of each element (``extensions.agsi.surfaces``); with that provenance each element
+is written once with its complete top and bottom lines, after checking that its volumes are
+exactly the polygons between them. Without it, volumes with the same element ID are merged only
+where they meet exactly at pinch-out vertices, else written as ``"(part n)"`` elements.
 
 A volume polygon is written as a top and a bottom profile only when that split is unique: see
 :func:`ring_to_profiles`. Anything else is rejected rather than approximated.
@@ -51,7 +58,7 @@ from scipy.spatial.transform import Rotation
 
 import evo.logging
 
-from ..geometry import SectionUnit, build_section_geometry
+from ..geometry import SectionUnit, build_section_geometry, profile_to_section
 from ..reader import AGSIInvalidDataError
 from .errors import AGSIExporterException, UnsupportedSectionGeometryError
 
@@ -317,13 +324,31 @@ def _number_or_none(value: Any) -> Optional[float]:
 
 
 @dataclass
-class _Unit:
-    volume_index: int
+class _Piece:
+    """One Evo volume as top and bottom profiles."""
+
+    index: int
     volume: Any
     top: FloatArray
     bottom: FloatArray
+
+
+@dataclass
+class _Unit:
+    """One AGSi element: one or more Evo volumes, and the element's complete top and bottom lines."""
+
+    element_id: str
+    pieces: list[_Piece]
+    top: FloatArray
+    bottom: FloatArray
+    row: "_Row"
+    part: str = ""
     omit_top: bool = False
     omit_bottom: bool = False
+
+    @property
+    def volume(self) -> Any:
+        return self.pieces[0].volume
 
 
 @dataclass
@@ -363,6 +388,7 @@ class _Builder:
 
         vertices, chunks = _line_geometry(go, source.load_table, name)
         rows = _volume_rows(go, source.load_table, extension)
+        provenance = _contact_provenance(go, extension)
         materials = {material.key: material for material in go.materials or []}
         folders = _section_folders(go.folders or [])
         system_id, units = self._xy_system(go.coordinate_reference_system)
@@ -377,7 +403,7 @@ class _Builder:
                 logger.warning(f"{label} has no volumes; it is not exported.")
                 continue
             origin, direction = section_axes(section, section_name)
-            units_in_order = _ordered_units(go, volume_indices, vertices, chunks, label)
+            units_in_order = _ordered_units(go, section, volume_indices, vertices, chunks, rows, provenance, label)
             boundaries = _boundary_lines(go, section, vertices, chunks)
             boundary = _omit_generated_lines(units_in_order, boundaries, origin[2])
             alignment = self._add_section_model(
@@ -388,7 +414,6 @@ class _Builder:
                 extension,
                 folders.get(index, []),
                 units_in_order,
-                rows,
                 materials,
                 origin,
                 direction,
@@ -425,7 +450,6 @@ class _Builder:
         extension: dict[str, Any],
         folder: list[str],
         units: list[_Unit],
-        rows: list[_Row],
         materials: dict[str, Any],
         origin: FloatArray,
         direction: FloatArray,
@@ -458,16 +482,11 @@ class _Builder:
         alignment_uri = self._add_file(f"Alignments/{_slug(alignment_id)}.wkt", linestring_wkt(alignment_xy))
 
         model_slug = _slug(model_id)
-        elements = []
-        counts: dict[str, int] = {}
-        bases = [_element_id(unit, rows[unit.volume_index]) for unit in units]
-        for base in bases:
-            counts[base] = counts.get(base, 0) + 1
-        seen: dict[str, int] = {}
-        for unit, base in zip(units, bases):
-            seen[base] = seen.get(base, 0) + 1
-            part = f" (part {seen[base]})" if counts[base] > 1 else ""
-            elements.append(self._element(unit, rows[unit.volume_index], base, part, materials, origin[2], model_slug))
+        element_ids: set[str] = set()
+        elements = [
+            self._element(unit, _unique(unit.element_id + unit.part, element_ids), materials, origin[2], model_slug)
+            for unit in units
+        ]
 
         model: dict[str, Any] = {
             "modelID": model_id,
@@ -506,15 +525,12 @@ class _Builder:
     def _element(
         self,
         unit: _Unit,
-        row: _Row,
-        base: str,
-        part: str,
+        element_id: str,
         materials: dict[str, Any],
         origin_z: float,
         model_slug: str,
     ) -> dict[str, Any]:
-        volume = unit.volume
-        element_id = base + part
+        volume, row = unit.volume, unit.row
         geometry: dict[str, Any] = {"description": volume.name}
         for which, line, omit in (("Top", unit.top, unit.omit_top), ("Bottom", unit.bottom, unit.omit_bottom)):
             if omit:
@@ -537,7 +553,9 @@ class _Builder:
             "agsiGeometry": geometry,
             "agsiDataParameterValue": row.parameters or None,
             "colourRGB": _colour_rgb(material.color) if material is not None else None,
-            "remarks": f"One of several separate polygons of '{base}' in the Evo section." if part else None,
+            "remarks": f"One of several separate polygons of '{unit.element_id}' in the Evo section."
+            if unit.part
+            else None,
         }
         return {key: value for key, value in element.items() if value is not None}
 
@@ -610,7 +628,8 @@ class _Builder:
                 + "; ".join(self.remarks)
                 + ".",
                 "producedBy": PRODUCED_BY,
-                "remarks": "Section models hold one agsiGeometryAreaFromLines element per Evo volume; their "
+                "remarks": "Section models hold one agsiGeometryAreaFromLines element per AGSi element recorded "
+                "in the Evo object (else per group of touching Evo volumes with one element ID); their "
                 "alignments are straight lines in a separate plan model. Profiles shared by neighbouring "
                 "elements are written once and referenced by both.",
             },
@@ -677,10 +696,22 @@ def _range_indices(indices_range: Any, total: int, what: str) -> list[int]:
 
 
 def _ordered_units(
-    go: Any, volume_indices: list[int], vertices: FloatArray, chunks: IntArray, label: str
+    go: Any,
+    section: Any,
+    volume_indices: list[int],
+    vertices: FloatArray,
+    chunks: IntArray,
+    rows: list[_Row],
+    provenance: Optional[list[dict[str, Any]]],
+    label: str,
 ) -> list[_Unit]:
-    """Volumes of a section as top/bottom profiles, ordered by ``layer_order`` where given."""
-    units = []
+    """AGSi elements of a section, ordered by ``layer_order`` where given.
+
+    With contact provenance (``extensions.agsi.surfaces``) and a section that lists its surfaces,
+    the volumes of each element are reconciled with its top and bottom surfaces; otherwise volumes
+    are grouped by element ID.
+    """
+    pieces = []
     for index in volume_indices:
         volume = go.volumes[index]
         volume_label = f"{label}, volume '{volume.name}'"
@@ -690,11 +721,214 @@ def _ordered_units(
             )
         ring = assemble_ring(vertices, chunks, volume.parts, volume_label)
         top, bottom = ring_to_profiles(ring, volume_label)
-        units.append(_Unit(index, volume, top, bottom))
+        pieces.append(_Piece(index, volume, top, bottom))
+    if provenance is not None and section.surfaces is not None:
+        units = _units_from_provenance(go, section, pieces, vertices, chunks, rows, provenance, label)
+    else:
+        units = _units_from_volumes(pieces, rows, label)
     order = {layer: position for position, layer in enumerate(getattr(go, "layer_order", None) or [])}
     if order:
-        units.sort(key=lambda unit: order.get(unit.volume.layer or unit.volume.material_key, len(order)))
+        units.sort(key=lambda unit: order.get(_layer(unit.volume), len(order)))
     return units
+
+
+def _layer(volume: Any) -> Optional[str]:
+    return _text(volume.layer) or _text(volume.material_key)
+
+
+def _contact_provenance(go: Any, extension: dict[str, Any]) -> Optional[list[dict[str, Any]]]:
+    """``extensions.agsi.surfaces`` written by the importer, checked against the object's surfaces.
+
+    :raise AGSIExporterException: If it is present but does not describe the current surfaces.
+    """
+    if "surfaces" not in extension:
+        return None
+    entries = extension["surfaces"]
+    hint = (
+        "it no longer matches the object, which was probably edited since it was imported from AGSi. Remove "
+        "extensions.agsi.surfaces to export every volume as a separate element"
+    )
+    if not isinstance(entries, list) or len(entries) != len(go.surfaces):
+        raise AGSIExporterException(
+            f"Object '{go.name}': extensions.agsi.surfaces describes "
+            f"{len(entries) if isinstance(entries, list) else 'no'} surfaces but the object has "
+            f"{len(go.surfaces)}; {hint}."
+        )
+    for index, (entry, surface) in enumerate(zip(entries, go.surfaces)):
+        valid = (
+            isinstance(entry, dict)
+            and entry.get("name") == surface.name
+            and all(
+                isinstance(entry.get(key), list) and all(isinstance(item, str) for item in entry[key])
+                for key in ("topOf", "bottomOf")
+            )
+        )
+        if not valid:
+            raise AGSIExporterException(
+                f"Object '{go.name}': extensions.agsi.surfaces[{index}] does not describe surface "
+                f"'{surface.name}'; {hint}."
+            )
+    return entries
+
+
+def _units_from_provenance(
+    go: Any,
+    section: Any,
+    pieces: list[_Piece],
+    vertices: FloatArray,
+    chunks: IntArray,
+    rows: list[_Row],
+    provenance: list[dict[str, Any]],
+    label: str,
+) -> list[_Unit]:
+    """One element per layer: its top and bottom surfaces, checked against its volumes.
+
+    The volumes of an element must be exactly the polygons that its current top and bottom lines
+    enclose (as the importer builds them), so geometry edits made consistently in Evo are
+    exported, while deleted, added or reshaped volumes that disagree with the surfaces are
+    rejected rather than replaced by the surface lines.
+    """
+    tops: dict[str, list[int]] = {}
+    bottoms: dict[str, list[int]] = {}
+    for index in _range_indices(section.surfaces, len(go.surfaces), f"{label}: surfaces"):
+        for key in provenance[index]["topOf"]:
+            tops.setdefault(key, []).append(index)
+        for key in provenance[index]["bottomOf"]:
+            bottoms.setdefault(key, []).append(index)
+    groups: dict[str, list[_Piece]] = {}
+    for piece in pieces:
+        key = _layer(piece.volume)
+        if key is None or (key not in tops and key not in bottoms):
+            raise AGSIExporterException(
+                f"{label}, volume '{piece.volume.name}': layer '{key}' is not the top or bottom of any surface "
+                "in extensions.agsi.surfaces, so its AGSi element cannot be reconstructed. Remove "
+                "extensions.agsi.surfaces to export every volume as a separate element."
+            )
+        groups.setdefault(key, []).append(piece)
+
+    def line(key: str, which: str, found: dict[str, list[int]]) -> tuple[FloatArray, str]:
+        if len(found.get(key, [])) != 1:
+            raise AGSIExporterException(
+                f"{label}: extensions.agsi.surfaces names {len(found.get(key, []))} {which} surfaces for element "
+                f"'{key}'; exactly one is needed."
+            )
+        surface = go.surfaces[found[key][0]]
+        chain = assemble_chain(vertices, chunks, surface.parts, f"{label}, surface '{surface.name}'")
+        try:
+            return profile_to_section(chain, f"{label}, surface '{surface.name}'"), surface.name
+        except AGSIInvalidDataError as e:
+            raise UnsupportedSectionGeometryError(str(e)) from e
+
+    units = []
+    for key in dict.fromkeys([*groups, *tops, *bottoms]):
+        (top, top_name), (bottom, bottom_name) = line(key, "top", tops), line(key, "bottom", bottoms)
+        group = groups.get(key, [])
+        expected = _enclosed_pieces(top, bottom, f"{label}, element '{key}'")
+        if expected != sorted(_piece_key(piece.top, piece.bottom) for piece in group):
+            raise UnsupportedSectionGeometryError(
+                f"{label}: the {len(group)} volumes of element '{key}' are not the {len(expected)} polygons "
+                f"between its top surface '{top_name}' and bottom surface '{bottom_name}' recorded in "
+                "extensions.agsi.surfaces; the object was edited inconsistently with that provenance. Remove "
+                "extensions.agsi.surfaces to export every volume as a separate element."
+            )
+        if not group:
+            logger.warning(f"{label}: element '{key}' has zero thickness everywhere (no volume); it is not exported.")
+            continue
+        row = _group_row(group, rows)
+        if row is None:
+            raise AGSIExporterException(
+                f"{label}: the volumes of element '{key}' have different names, descriptions, materials or "
+                "attribute values; they cannot be written as one AGSi element."
+            )
+        units.append(_Unit(row.element_id or key, group, top, bottom, row))
+    return units
+
+
+def _units_from_volumes(pieces: list[_Piece], rows: list[_Row], label: str) -> list[_Unit]:
+    """Elements from volumes grouped by element ID, without contact provenance.
+
+    Volumes of one element are merged only when they meet end to end at single-vertex pinch-outs
+    and the merged lines enclose exactly those volumes; nothing is added between them. Otherwise
+    each volume becomes its own ``"<element ID> (part n)"`` element.
+    """
+    groups: dict[str, list[_Piece]] = {}
+    for piece in pieces:
+        volume, row = piece.volume, rows[piece.index]
+        base = row.element_id or _layer(volume) or volume.name
+        groups.setdefault(base, []).append(piece)
+    units = []
+    for base, group in groups.items():
+        if len(group) == 1:
+            units.append(_Unit(base, group, group[0].top, group[0].bottom, rows[group[0].index]))
+            continue
+        group_row = _group_row(group, rows)
+        merged = _merge_touching(group, f"{label}, element '{base}'") if group_row is not None else None
+        if group_row is not None and merged is not None:
+            units.append(_Unit(base, group, merged[0], merged[1], group_row))
+            continue
+        logger.warning(
+            f"{label}: element '{base}' has {len(group)} separate volumes that do not meet at single-vertex "
+            "pinch-outs, and the object has no contact provenance (extensions.agsi.surfaces); each volume is "
+            "written as a separate '(part n)' element."
+        )
+        units.extend(
+            _Unit(base, [piece], piece.top, piece.bottom, rows[piece.index], part=f" (part {number})")
+            for number, piece in enumerate(group, start=1)
+        )
+    return units
+
+
+def _merge_touching(group: list[_Piece], label: str) -> Optional[tuple[FloatArray, FloatArray]]:
+    """Top and bottom lines through volumes that meet exactly at pinch-out vertices, if they do."""
+    ordered = sorted(group, key=lambda piece: float(piece.top[0, 0]))
+    for before, after in zip(ordered, ordered[1:]):
+        joint = before.top[-1]
+        if not (
+            np.array_equal(before.bottom[-1], joint)
+            and np.array_equal(after.top[0], joint)
+            and np.array_equal(after.bottom[0], joint)
+        ):
+            return None
+    top = np.concatenate([ordered[0].top, *(piece.top[1:] for piece in ordered[1:])])
+    bottom = np.concatenate([ordered[0].bottom, *(piece.bottom[1:] for piece in ordered[1:])])
+    try:
+        expected = _enclosed_pieces(top, bottom, label)
+    except UnsupportedSectionGeometryError:
+        return None
+    if expected != sorted(_piece_key(piece.top, piece.bottom) for piece in group):
+        return None
+    return top, bottom
+
+
+def _enclosed_pieces(top: FloatArray, bottom: FloatArray, label: str) -> list[tuple[bytes, bytes]]:
+    """Profiles of the polygons the importer builds between ``top`` and ``bottom`` (sorted keys)."""
+    try:
+        geometry = build_section_geometry([SectionUnit(key=label, top=top, bottom=bottom)])
+    except AGSIInvalidDataError as e:
+        raise UnsupportedSectionGeometryError(f"{label}: {e}") from e
+    return sorted(_piece_key(*ring_to_profiles(geometry.ring(volume), label)) for volume in geometry.volumes)
+
+
+def _piece_key(top: FloatArray, bottom: FloatArray) -> tuple[bytes, bytes]:
+    return (
+        np.ascontiguousarray(top, dtype=np.float64).tobytes(),
+        np.ascontiguousarray(bottom, dtype=np.float64).tobytes(),
+    )
+
+
+def _group_row(group: list[_Piece], rows: list[_Row]) -> Optional[_Row]:
+    """Shared element fields of the volumes of one element, or ``None`` if they differ."""
+    first = group[0]
+    for piece in group[1:]:
+        volume = piece.volume
+        if (
+            rows[piece.index] != rows[first.index]
+            or volume.name != first.volume.name
+            or volume.description != first.volume.description
+            or volume.material_key != first.volume.material_key
+        ):
+            return None
+    return rows[first.index]
 
 
 def _boundary_lines(go: Any, section: Any, vertices: FloatArray, chunks: IntArray) -> set[bytes]:
@@ -753,11 +987,6 @@ def _chainage_range(units: list[_Unit], extension: dict[str, Any], name: str) ->
             "alignment is made to span the profiles."
         )
     return low, high - low
-
-
-def _element_id(unit: _Unit, row: _Row) -> str:
-    volume = unit.volume
-    return row.element_id or _text(volume.layer) or _text(volume.material_key) or volume.name
 
 
 def _section_folders(folders: list[Any], path: Optional[list[str]] = None) -> dict[int, list[str]]:

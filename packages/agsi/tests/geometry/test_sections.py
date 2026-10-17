@@ -140,10 +140,17 @@ class TestBuildSectionGeometry:
 
     def test_different_sampling_exact_crossing_check(self) -> None:
         top = _line((0, 0), (4, 0))
+        clear = _line((0, -1), (2, -0.5), (4, 0))
+        (ring,) = _rings(build_section_geometry([SectionUnit("U", top, clear)]), "U")
+        np.testing.assert_array_equal(ring, [[0, 0], [4, 0], [2, -0.5], [0, -1], [0, 0]])
+
+        # An interior touch cannot be split without inserting vertices; it would self-touch.
         touching = _line((0, -1), (2, 0), (4, -1))
-        geometry = build_section_geometry([SectionUnit("U", top, touching)])
-        (ring,) = _rings(geometry, "U")
-        np.testing.assert_array_equal(ring, [[0, 0], [4, 0], [4, -1], [2, 0], [0, -1], [0, 0]])
+        with pytest.raises(AGSIUnsupportedGeometryError, match="meet at chainage 2.0"):
+            build_section_geometry([SectionUnit("U", top, touching)])
+        with pytest.raises(AGSIUnsupportedGeometryError, match="meet at chainage 1.0"):
+            build_section_geometry([SectionUnit("U", _line((0, 1), (1, 0), (4, 1)), _line((0, 0), (4, 0)))])
+        assert build_section_geometry([SectionUnit("U", top, _line((0, 0), (2, 0), (4, 0)))]).volumes == []
 
         crossing = _line((0, -1), (2, 0.25), (4, -1))
         with pytest.raises(AGSIInvalidDataError, match="crosses below"):
@@ -162,8 +169,16 @@ class TestBuildSectionGeometry:
             build_section_geometry([SectionUnit("U", top=top)])
         with pytest.raises(AGSIInvalidDataError, match="crosses below"):
             build_section_geometry([SectionUnit("U", top=top)], base_elevation=1.5)
-        (ring,) = _rings(build_section_geometry([SectionUnit("U", top=top)], base_elevation=1.0), "U")
-        np.testing.assert_array_equal(ring, [[0, 2], [3, 1], [6, 2], [6, 1], [0, 1], [0, 2]])
+        (ring,) = _rings(build_section_geometry([SectionUnit("U", top=top)], base_elevation=0.0), "U")
+        np.testing.assert_array_equal(ring, [[0, 2], [3, 1], [6, 2], [6, 0], [0, 0], [0, 2]])
+        # A top touching the base inside the unit pinches it out: the horizontal base is sampled at the
+        # top's chainages (exactly) so two simple polygons meet at the contact, not one self-touching ring.
+        geometry = build_section_geometry([SectionUnit("U", top=top)], base_elevation=1.0)
+        left, right = _rings(geometry, "U")
+        np.testing.assert_array_equal(left, [[0, 2], [3, 1], [0, 1], [0, 2]])
+        np.testing.assert_array_equal(right, [[3, 1], [6, 2], [6, 1], [3, 1]])
+        assert geometry.lines[1].generated
+        assert len(geometry.vertices) == 3 + 3 + 2 + 2  # top, sampled base, and the two end edges
 
         bottom = _line((0, 0), (6, -1))
         with pytest.raises(AGSIInvalidDataError, match="top elevation is required"):

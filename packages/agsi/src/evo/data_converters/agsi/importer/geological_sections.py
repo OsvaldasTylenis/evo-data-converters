@@ -200,7 +200,7 @@ def build_geological_sections(
         uuid=None,
         description=model.description,
         tags=tags,
-        extensions={"agsi": _agsi_extension(package, model, alignment, section)},
+        extensions={"agsi": _agsi_extension(package, model, alignment, section, surfaces)},
         bounding_box=bounding_box,
         coordinate_reference_system=coordinate_reference_system,
         folders=[
@@ -322,9 +322,19 @@ def _continuous_attribute(
 
 
 def _agsi_extension(
-    package: AgsiPackage, model: AgsiModel, alignment: Optional[AgsiModelAlignment], section: ModelSection
+    package: AgsiPackage,
+    model: AgsiModel,
+    alignment: Optional[AgsiModelAlignment],
+    section: ModelSection,
+    surfaces: list[GeologicalSections_V1_2_0_GmEmbeddedPolylineSurface],
 ) -> dict[str, Any]:
-    """AGSi identifiers of the source model, kept under ``extensions.agsi``."""
+    """AGSi identifiers of the source model, kept under ``extensions.agsi``.
+
+    ``surfaces`` records, for each Evo surface in order, the volume layers (element keys) whose
+    top (``topOf``) and bottom (``bottomOf``) it is. An element that pinches out has several
+    volumes; this contact provenance lets the exporter write it as one AGSi element again with
+    its complete top and bottom profiles.
+    """
     extension: dict[str, Any] = {
         "schemaVersion": package.schema_version,
         "modelID": model.model_id,
@@ -339,6 +349,10 @@ def _agsi_extension(
     parameter_columns = _parameter_columns(section)
     if parameter_columns:
         extension["parameterColumns"] = parameter_columns
+    extension["surfaces"] = [
+        {"name": surface.name, "topOf": list(line.top_of), "bottomOf": list(line.bottom_of)}
+        for surface, line in zip(surfaces, section.geometry.lines)
+    ]
     return {key: value for key, value in extension.items() if value is not None}
 
 

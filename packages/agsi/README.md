@@ -72,7 +72,12 @@ Object layout:
 | `surfaces` | one per distinct top/bottom line (`ContactSurface`); generated horizontal lines are `BoundarySurface` |
 | `materials`, `layer_order` | one per element (`colourRGB` or a default colour), top to bottom |
 | `volume_attributes` | `elementID`, `elementType`, and one attribute per `agsiDataParameterValue` code (and case); numeric values are continuous, others strings |
-| `extensions.agsi` | `schemaVersion`, `modelID`, `modelName`, `coordSystemID`, `alignmentID`, `alignmentName`, `startChainage`, `alignmentLength`; `parameterColumns` maps attribute names of parameters with a `caseID` to their `codeID` and `caseID` |
+| `extensions.agsi` | `schemaVersion`, `modelID`, `modelName`, `coordSystemID`, `alignmentID`, `alignmentName`, `startChainage`, `alignmentLength`; `parameterColumns` maps attribute names of parameters with a `caseID` to their `codeID` and `caseID`; `surfaces` lists, per surface, the elements it is the top (`topOf`) and bottom (`bottomOf`) of |
+
+An element that pinches out (its top and bottom meet) is several volumes: an Evo volume is one
+simple polygon and cannot hold separate areas or touch itself. Its volumes share the element's
+`layer`, material and attributes, and `extensions.agsi.surfaces` records its top and bottom lines,
+so the exporter can rebuild the one AGSi element.
 
 Models without section areas (plan models holding alignments, 3D models of surfaces) are skipped.
 `valueProfile` parameters are not converted.
@@ -102,7 +107,7 @@ package from objects already in memory: `build_agsi_export([SectionsSource(obj, 
 | `agsFile`, `agsProject` | the file name; per section model one `XZ` coordinate system (chainage, elevation; `systemID` from `coordSystemID`), and one `XY` system per distinct object CRS (`Evo-XY`; `globalXYSystem` `EPSG:n` for EPSG codes; name, axes and units from the CRS, `unknown` units without one) |
 | section `agsiModel` | one per section; `modelID`, `modelName`, `coordSystemID` and `alignmentID` from `extensions.agsi` when the object has a single section, else derived from the object and section names; the Evo folder path is noted in `remarks` |
 | plan `agsiModel`, `agsiModelAlignment` | one plan model per object holding a straight 2-point alignment through the section origin along its strike, from `startChainage` to `startChainage + alignmentLength` (from `extensions.agsi` when they cover the profiles, else the profiles' chainage range) |
-| `agsiModelElement` | one per volume, in `layer_order`; `elementID` from the `elementID` attribute (else `layer`, `material_key`, `name`); `elementName` from the volume name when different; `colourRGB` from the material |
+| `agsiModelElement` | one per AGSi element (see below), in `layer_order`; `elementID` from the `elementID` attribute (else `layer`, `material_key`, `name`); `elementName` from the volume name when different; `colourRGB` from the material |
 | `agsiGeometryAreaFromLines` | top and bottom WKT `LINESTRING (chainage elevation, ...)` profiles; identical lines (shared contacts) are written once and referenced by both units |
 | `agsiModelBoundary` | `topElevation` / `bottomElevation` when a generated horizontal `BoundarySurface` line closes the units at one elevation; that line is then omitted from the profiles |
 | `agsiDataParameterValue` | one per volume attribute value: continuous and integer → `valueNumeric`, string and category → `valueText`; `codeID`/`caseID` from `parameterColumns`, else the attribute name. Missing values are skipped; other attribute types (e.g. bool) are not exported (with a warning) |
@@ -113,22 +118,40 @@ Constraints (each raises `UnsupportedSectionGeometryError` and nothing is writte
   `v + origin.z`.
 * Each volume must be a single ring without internal rings, with non-zero area, that splits at its
   lowest- and highest-chainage vertices into one top and one bottom line, each strictly increasing
-  in chainage (no overhangs or vertical steps) with the top never below the bottom.
+  in chainage (no overhangs or vertical steps) with the top never below the bottom. Vertical edges
+  at either end are left out of the lines. Where a polygon ends in a point, top and bottom meet
+  there. No other split (such as halfway in elevation) is ever guessed.
+
+Elements (top and bottom lines from the volumes of one element):
+
+* **With `extensions.agsi.surfaces`** (objects imported from AGSi), the volumes with the same
+  `layer` are one element. Its top and bottom lines are read from the current surfaces that the
+  provenance names, so edits made consistently in Evo are exported. The volumes must be exactly
+  the polygons those lines enclose (as the importer builds them). A deleted, added or reshaped
+  volume, or volumes of one element with different names, materials or attribute values, raise
+  an error instead of being replaced by the surface lines. An element with zero thickness
+  everywhere has no volume and is not exported (with a warning). Sections that do not list
+  their surfaces are exported as below.
+* **Without it**, volumes are grouped by element ID. Volumes that meet end to end, exactly at
+  single pinch-out vertices, are joined into one element. Otherwise each volume is written as
+  its own element `"<elementID> (part n)"` with a remark and a warning, and the zero-thickness
+  gaps between them are not invented.
 
 Other behaviour:
 
-* A unit that pinches out is several Evo volumes; each is written as its own element,
-  `"<elementID> (part n)"`, with a remark. The zero-thickness gaps between them are not
-  reconstructed from neighbouring units.
 * Sections without volumes are skipped; an object with no volumes, a non-`geological-sections`
   object or an empty object list raise `AGSIExporterException` / `UnsupportedObjectError`.
-* Not kept: the original XY `systemID`, geometry descriptions, revisions and remarks; palette
-  colours become explicit `colourRGB`; mixed numeric/text parameters (stored as strings in Evo)
-  come back as `valueText`.
+* Not kept: the original XY `systemID`, geometry descriptions, revisions and remarks, and the
+  number formatting of the source WKT; duplicate source files of one contact become one file;
+  palette colours become explicit `colourRGB`; mixed numeric/text parameters (stored as strings
+  in Evo) come back as `valueText`.
 
-Round trip: for units that do not pinch out, importing an AGSi file, exporting it and importing the
-result gives the same `line_geometry` vertices, sections, volumes, materials, attributes and
-extensions. Exported packages validate against the AGSi 1.0.1 JSON schema.
+Round trip: importing an AGSi file, exporting it and importing the result gives the same
+`line_geometry` vertices and chunks, sections, volumes, surfaces, materials, attributes and
+extensions. The straight synthetic Silvertown sample keeps its 11 elements (IDs, types,
+descriptions, parameters) with vertex-identical top and bottom profiles and its 10 shared
+contacts, and its 22 volumes and 12 surfaces are the same after a round trip. The files are
+not byte-identical (see above). Exported packages validate against the AGSi 1.0.1 JSON schema.
 
 ### Reading AGSi packages
 
@@ -240,8 +263,10 @@ frame.section_to_world(geometry.vertices)  # world x, y, z
 * **Units.** A unit's top and bottom must cover the same chainage range. Where they coincide
   (pinch-out) the unit is split into separate polygons; a unit with zero thickness everywhere has
   no polygon. A top below its bottom raises `AGSIInvalidDataError`, checked exactly. Pinch-out
-  splitting needs top and bottom to share their chainage sampling; otherwise one polygon is made,
-  and it may touch itself.
+  splitting needs top and bottom to share their chainage sampling. If they are sampled
+  differently and touch strictly inside the unit, the polygon would touch itself, so
+  `AGSIUnsupportedGeometryError` is raised. The exception is a generated horizontal top or base
+  (below): it is sampled at the other line's chainages, which is exact.
 * **Shared contacts.** Identical profiles (such as the base of one unit and the top of the next)
   are stored once and split at the same chainages, so neighbouring polygons share their
   boundaries exactly.
