@@ -72,12 +72,12 @@ Object layout:
 | `surfaces` | one per distinct top/bottom line (`ContactSurface`); generated horizontal lines are `BoundarySurface` |
 | `materials`, `layer_order` | one per element (`colourRGB` or a default colour), top to bottom |
 | `volume_attributes` | `elementID`, `elementType`, and one attribute per `agsiDataParameterValue` code (and case); numeric values are continuous, others strings |
-| `extensions.agsi` | `schemaVersion`, `modelID`, `modelName`, `coordSystemID`, `alignmentID`, `alignmentName`, `startChainage`, `alignmentLength`; `parameterColumns` maps attribute names of parameters with a `caseID` to their `codeID` and `caseID`; `surfaces` lists, per surface, the elements it is the top (`topOf`) and bottom (`bottomOf`) of |
+| `extensions.agsi` | `schemaVersion`, `modelID`, `modelName`, `coordSystemID`, `alignmentID`, `alignmentName`, `startChainage`, `alignmentLength`; `parameterColumns` maps attribute names of parameters with a `caseID` to their `codeID` and `caseID` |
 
 An element that pinches out (its top and bottom meet) is several volumes: an Evo volume is one
 simple polygon and cannot hold separate areas or touch itself. Its volumes share the element's
-`layer`, material and attributes, and `extensions.agsi.surfaces` records its top and bottom lines,
-so the exporter can rebuild the one AGSi element.
+`layer`, material and attributes. Which surfaces are the top and bottom of which element is not
+recorded, so on export such an element may become several `"(part n)"` elements (see below).
 
 Models without section areas (plan models holding alignments, 3D models of surfaces) are skipped.
 `valueProfile` parameters are not converted.
@@ -124,18 +124,15 @@ Constraints (each raises `UnsupportedSectionGeometryError` and nothing is writte
 
 Elements (top and bottom lines from the volumes of one element):
 
-* **With `extensions.agsi.surfaces`** (objects imported from AGSi), the volumes with the same
-  `layer` are one element. Its top and bottom lines are read from the current surfaces that the
-  provenance names, so edits made consistently in Evo are exported. The volumes must be exactly
-  the polygons those lines enclose (as the importer builds them). A deleted, added or reshaped
-  volume, or volumes of one element with different names, materials or attribute values, raise
-  an error instead of being replaced by the surface lines. An element with zero thickness
-  everywhere has no volume and is not exported (with a warning). Sections that do not list
-  their surfaces are exported as below.
-* **Without it**, volumes are grouped by element ID. Volumes that meet end to end, exactly at
-  single pinch-out vertices, are joined into one element. Otherwise each volume is written as
-  its own element `"<elementID> (part n)"` with a remark and a warning, and the zero-thickness
-  gaps between them are not invented.
+* Volumes are grouped by element ID. Volumes that meet end to end, exactly at single pinch-out
+  vertices (and have the same name, description, material and attributes), are joined into one
+  element. Otherwise each volume is written as its own element `"<elementID> (part n)"` with a
+  remark and a warning; the zero-thickness runs between them are not invented, and a
+  zero-thickness run at the end of an element is not written (its lines end where the volume
+  ends). An element with zero thickness everywhere has no volume and is not written.
+* `extensions.agsi.surfaces` (top/bottom relationships recorded by earlier versions of the
+  importer) is ignored, so stale relationships never override the current volumes; it is not
+  removed from the object.
 
 Other behaviour:
 
@@ -146,12 +143,16 @@ Other behaviour:
   palette colours become explicit `colourRGB`; mixed numeric/text parameters (stored as strings
   in Evo) come back as `valueText`.
 
-Round trip: importing an AGSi file, exporting it and importing the result gives the same
-`line_geometry` vertices and chunks, sections, volumes, surfaces, materials, attributes and
-extensions. The straight synthetic Silvertown sample keeps its 11 elements (IDs, types,
-descriptions, parameters) with vertex-identical top and bottom profiles and its 10 shared
-contacts, and its 22 volumes and 12 surfaces are the same after a round trip. The files are
-not byte-identical (see above). Exported packages validate against the AGSi 1.0.1 JSON schema.
+Round trip: the first export of an imported file writes each unit that pinches out (except at
+exact single pinch-out vertices) as several `"(part n)"` elements, so the straight synthetic
+Silvertown sample's 11 elements become 21 (Surficial 4 parts, Alluvium 5, River Terrace Deposits
+2, Woolwich Lower Shelly Clay 2, Upnor 2), with types, descriptions and parameters of the source
+element and every profile a vertex-identical run of a source line; contacts between parts stay
+separate files (40 profiles). No geometry is invented. Importing that package again gives 22
+volumes and 41 surfaces, and further round trips are stable: the second export only drops the
+`"(part n)"` remarks (element remarks are not kept in Evo), after which the files are
+byte-identical when the same title is used. The files are not byte-identical to the source (see
+above). Exported packages validate against the AGSi 1.0.1 JSON schema.
 
 ### Reading AGSi packages
 

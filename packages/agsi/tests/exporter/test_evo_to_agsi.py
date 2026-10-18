@@ -15,6 +15,7 @@ import dataclasses
 import json
 import logging
 import os
+import re
 import zipfile
 from collections import Counter
 from pathlib import Path
@@ -236,13 +237,45 @@ def pinch(folder: Path, indices: list[int]) -> tuple[np.ndarray, np.ndarray]:
     return top, contact
 
 
-def without_provenance(obj: GeologicalSections_V1_2_0) -> GeologicalSections_V1_2_0:
-    agsi = {key: value for key, value in obj.extensions["agsi"].items() if key != "surfaces"}
-    return dataclasses.replace(obj, extensions={"agsi": agsi})
+def with_historical_surfaces(obj: GeologicalSections_V1_2_0, entries: Any) -> GeologicalSections_V1_2_0:
+    """Add ``extensions.agsi.surfaces`` as written by earlier versions of the importer."""
+    return dataclasses.replace(obj, extensions={"agsi": {**obj.extensions["agsi"], "surfaces": entries}})
+
+
+def package_bytes(path: Path) -> dict[str, bytes]:
+    with zipfile.ZipFile(path) as archive:
+        return {name: archive.read(name) for name in archive.namelist()}
+
+
+def main_document(files: dict[str, bytes]) -> Any:
+    return json.loads(files[json.loads(files["index.json"])["agsiIndex"]["filePath"]])
+
+
+def assert_stable(path: Path, client: MagicMock, tmp_path: Path) -> GeologicalSections_V1_2_0:
+    """Importing an exported package and exporting it again changes nothing after the first time.
+
+    The second export only drops the remarks the exporter wrote on ``"(part n)"`` elements (element
+    remarks are not kept in Evo); a third export is byte-identical to the second.
+    """
+    again = import_mini(path, client)
+    assert "surfaces" not in again.extensions["agsi"]
+    export([again], client, tmp_path / "second.agsi")
+    first, second = package_bytes(path), package_bytes(tmp_path / "second.agsi")
+    expected = main_document(first)
+    for model in expected["agsiModel"]:
+        for element in model.get("agsiModelElement", []):
+            if element.get("remarks", "").startswith("One of several separate polygons of"):
+                del element["remarks"]
+    assert main_document(second) == expected
+    main = json.loads(first["index.json"])["agsiIndex"]["filePath"]
+    assert {k: v for k, v in second.items() if k != main} == {k: v for k, v in first.items() if k != main}
+    export([import_mini(tmp_path / "second.agsi", client)], client, tmp_path / "third.agsi")
+    assert package_bytes(tmp_path / "third.agsi") == second
+    return again
 
 
 def assert_same_import(again: GeologicalSections_V1_2_0, obj: GeologicalSections_V1_2_0, client: MagicMock) -> None:
-    """The re-imported object has the same line geometry, volumes, surfaces and provenance."""
+    """The re-imported object has the same line geometry, volumes, surfaces and extensions."""
     for name in ("vertices", "chunks"):
         assert loader(client)(getattr(again.line_geometry, name)).equals(
             loader(client)(getattr(obj.line_geometry, name))
@@ -254,72 +287,58 @@ def assert_same_import(again: GeologicalSections_V1_2_0, obj: GeologicalSections
     assert again.extensions == obj.extensions
 
 
-class TestElementReconstruction:
-    """A unit that pinches out is several Evo volumes but is exported as one AGSi element again."""
+WHOLE = slice(None)
+
+
+class TestElementGrouping:
+    """A unit that pinches out is several Evo volumes; they are one element only where they touch."""
 
     @pytest.mark.parametrize(
-        ("indices", "volumes"),
+        ("indices", "volumes", "elements"),
         [
-            ([2], 2),  # internal pinch at one vertex
-            ([2, 3], 2),  # internal zero-thickness run
-            ([0], 1),  # left end pinched
-            ([0, 5], 1),  # both ends pinched
-            ([4, 5], 1),  # zero-thickness run at the right end: the volume is shorter than the lines
-            ([0, 2, 3, 5], 2),
+            ([2], 2, {"": WHOLE}),  # internal pinch at one vertex: the volumes touch and are merged
+            ([2, 3], 2, {" (part 1)": slice(0, 3), " (part 2)": slice(3, None)}),  # internal zero-thickness run
+            ([0], 1, {"": WHOLE}),  # left end pinched
+            ([0, 5], 1, {"": WHOLE}),  # both ends pinched
+            ([4, 5], 1, {"": slice(0, 5)}),  # zero-thickness run at the right end: the lines end with the volume
+            ([0, 2, 3, 5], 2, {" (part 1)": slice(0, 3), " (part 2)": slice(3, None)}),
         ],
     )
-    def test_pinched_unit_is_one_element(
-        self, straight_wkt_dir: Path, local_data_client: MagicMock, tmp_path: Path, indices: list[int], volumes: int
-    ) -> None:
-        top, contact = pinch(straight_wkt_dir, indices)
-        obj = import_mini(straight_wkt_dir, local_data_client, base_elevation=-50.0)
-        assert Counter(v.layer for v in obj.volumes) == {SURFICIAL: volumes, ALLUVIUM: 1}
-
-        package = export([obj], local_data_client, tmp_path / "out.agsi")
-        surficial, alluvium = package.models[0].agsi_model_element
-        assert [surficial.element_id, alluvium.element_id] == [SURFICIAL, ALLUVIUM]
-        assert surficial.remarks is None
-        # The complete source lines, including zero-thickness runs; the contact is one shared file.
-        geometry = surficial.agsi_geometry
-        np.testing.assert_array_equal(profile(package, geometry.agsi_geometry_top), top)
-        np.testing.assert_array_equal(profile(package, geometry.agsi_geometry_bottom), contact)
-        assert alluvium.agsi_geometry.agsi_geometry_top.file_uri == geometry.agsi_geometry_bottom.file_uri
-
-        assert_same_import(import_mini(tmp_path / "out.agsi", local_data_client), obj, local_data_client)
-
-    def test_without_provenance_touching_volumes_merge(
-        self, straight_wkt_dir: Path, local_data_client: MagicMock, tmp_path: Path
-    ) -> None:
-        # Volumes of one element that meet exactly at a pinch-out vertex are merged without adding anything.
-        top, contact = pinch(straight_wkt_dir, [2])
-        obj = without_provenance(import_mini(straight_wkt_dir, local_data_client, base_elevation=-50.0))
-        package = export([obj], local_data_client, tmp_path / "out.agsi")
-        surficial, _ = package.models[0].agsi_model_element
-        assert surficial.element_id == SURFICIAL
-        np.testing.assert_array_equal(profile(package, surficial.agsi_geometry.agsi_geometry_top), top)
-        np.testing.assert_array_equal(profile(package, surficial.agsi_geometry.agsi_geometry_bottom), contact)
-        again = import_mini(tmp_path / "out.agsi", local_data_client)
-        assert again.volumes == obj.volumes and again.sections == obj.sections
-
-    def test_without_provenance_separated_volumes_are_parts(
+    def test_pinched_unit(
         self,
         straight_wkt_dir: Path,
         local_data_client: MagicMock,
         tmp_path: Path,
         caplog: pytest.LogCaptureFixture,
+        indices: list[int],
+        volumes: int,
+        elements: dict[str, slice],
     ) -> None:
-        # Across a zero-thickness run the lines between the volumes are unknown: nothing is invented.
-        top, contact = pinch(straight_wkt_dir, [2, 3])
-        obj = without_provenance(import_mini(straight_wkt_dir, local_data_client, base_elevation=-50.0))
+        top, contact = pinch(straight_wkt_dir, indices)
+        obj = import_mini(straight_wkt_dir, local_data_client, base_elevation=-50.0)
+        assert Counter(v.layer for v in obj.volumes) == {SURFICIAL: volumes, ALLUVIUM: 1}
+
+        path = tmp_path / "out.agsi"
         with caplog.at_level(logging.WARNING):
-            package = export([obj], local_data_client, tmp_path / "out.agsi")
-        assert "written as a separate '(part n)' element" in caplog.text
-        elements = package.models[0].agsi_model_element
-        assert [e.element_id for e in elements] == [f"{SURFICIAL} (part 1)", f"{SURFICIAL} (part 2)", ALLUVIUM]
-        assert all("separate polygons" in e.remarks for e in elements[:2])
-        first, second = (profile(package, e.agsi_geometry.agsi_geometry_top) for e in elements[:2])
-        np.testing.assert_array_equal(first, top[:3])
-        np.testing.assert_array_equal(second, top[3:])
+            package = export([obj], local_data_client, path)
+        assert ("'(part n)' element" in caplog.text) == (len(elements) > 1)
+        *parts, alluvium = package.models[0].agsi_model_element
+        assert [e.element_id for e in parts] == [SURFICIAL + suffix for suffix in elements]
+        # Each part has a run of the source lines; nothing is added between or beyond the volumes.
+        for element, run in zip(parts, elements.values()):
+            assert (element.remarks is not None) == (len(elements) > 1)
+            geometry = element.agsi_geometry
+            np.testing.assert_array_equal(profile(package, geometry.agsi_geometry_top), top[run])
+            np.testing.assert_array_equal(profile(package, geometry.agsi_geometry_bottom), contact[run])
+        np.testing.assert_array_equal(profile(package, alluvium.agsi_geometry.agsi_geometry_top), contact)
+        shared = (
+            alluvium.agsi_geometry.agsi_geometry_top.file_uri == parts[0].agsi_geometry.agsi_geometry_bottom.file_uri
+        )
+        assert shared == (list(elements.values()) == [WHOLE])
+
+        again = assert_stable(path, local_data_client, tmp_path)
+        if list(elements.values()) == [WHOLE]:
+            assert_same_import(again, obj, local_data_client)
 
     def test_unit_touching_generated_base(
         self, straight_wkt_dir: Path, local_data_client: MagicMock, tmp_path: Path
@@ -343,7 +362,7 @@ class TestElementReconstruction:
     def test_edited_geometry_is_exported(
         self, straight_wkt_dir: Path, local_data_client: MagicMock, tmp_path: Path
     ) -> None:
-        # Moving a shared vertex in Evo changes the surface and the volume together: still consistent.
+        # Moving a shared vertex in Evo changes the surface and the volume together.
         top, _ = pinch(straight_wkt_dir, [2])
         obj = import_mini(straight_wkt_dir, local_data_client, base_elevation=-50.0)
         vertices = table(local_data_client, obj.line_geometry.vertices).copy()
@@ -362,63 +381,67 @@ class TestElementReconstruction:
         top[1, 1] += 0.5
         np.testing.assert_array_equal(exported, top)
 
-    def test_deleted_volume_is_rejected(
+    def test_deleted_volume_exports_remaining_volumes(
         self, straight_wkt_dir: Path, local_data_client: MagicMock, tmp_path: Path
     ) -> None:
-        pinch(straight_wkt_dir, [2])
+        top, contact = pinch(straight_wkt_dir, [2])
         obj = import_mini(straight_wkt_dir, local_data_client, base_elevation=-50.0)
         volumes = [obj.volumes[0], *obj.volumes[2:]]
         section = dataclasses.replace(
             obj.sections[0], volumes=dataclasses.replace(obj.sections[0].volumes, count=len(volumes))
         )
         edited = dataclasses.replace(obj, volumes=volumes, sections=[section], volume_attributes=[])
-        with pytest.raises(UnsupportedSectionGeometryError, match="the 1 volumes of element .* are not the 2 polygons"):
-            export([edited], local_data_client, tmp_path / "out.agsi")
-        # Without the provenance, the remaining volumes are exported as they are.
-        package = export([without_provenance(edited)], local_data_client, tmp_path / "out.agsi")
-        assert len(package.models[0].agsi_model_element) == 2
+        package = export([edited], local_data_client, tmp_path / "out.agsi")
+        surficial, alluvium = package.models[0].agsi_model_element
+        assert [surficial.element_id, alluvium.element_id] == [SURFICIAL, ALLUVIUM]
+        np.testing.assert_array_equal(profile(package, surficial.agsi_geometry.agsi_geometry_top), top[:3])
+        np.testing.assert_array_equal(profile(package, surficial.agsi_geometry.agsi_geometry_bottom), contact[:3])
 
-    def test_inconsistent_provenance(
+    def test_volumes_of_one_element_that_differ_are_parts(
         self, straight_wkt_dir: Path, local_data_client: MagicMock, tmp_path: Path
     ) -> None:
         pinch(straight_wkt_dir, [2])
         obj = import_mini(straight_wkt_dir, local_data_client, base_elevation=-50.0)
-        path = tmp_path / "out.agsi"
+        renamed = [obj.volumes[0], dataclasses.replace(obj.volumes[1], name="Other"), *obj.volumes[2:]]
+        package = export([dataclasses.replace(obj, volumes=renamed)], local_data_client, tmp_path / "out.agsi")
+        assert [e.element_id for e in package.models[0].agsi_model_element] == [
+            f"{SURFICIAL} (part 1)",
+            f"{SURFICIAL} (part 2)",
+            ALLUVIUM,
+        ]
 
-        renamed = [dataclasses.replace(obj.surfaces[0], name="Edited"), *obj.surfaces[1:]]
-        with pytest.raises(AGSIExporterException, match=r"surfaces\[0\] does not describe surface 'Edited'"):
-            export([dataclasses.replace(obj, surfaces=renamed)], local_data_client, path)
-        fewer = dataclasses.replace(obj, surfaces=obj.surfaces[:2])
-        with pytest.raises(AGSIExporterException, match="describes 3 surfaces but the object has 2"):
-            export([fewer], local_data_client, path)
-
-        relayered = [dataclasses.replace(obj.volumes[0], layer="Other", material_key="Other"), *obj.volumes[1:]]
-        with pytest.raises(AGSIExporterException, match="layer 'Other' is not the top or bottom of any surface"):
-            export([dataclasses.replace(obj, volumes=relayered)], local_data_client, path)
-
-        renamed_volume = [obj.volumes[0], dataclasses.replace(obj.volumes[1], name="Other"), *obj.volumes[2:]]
-        with pytest.raises(AGSIExporterException, match="different names"):
-            export([dataclasses.replace(obj, volumes=renamed_volume)], local_data_client, path)
-
-        agsi = dict(obj.extensions["agsi"])
-        agsi["surfaces"] = [dict(entry) for entry in agsi["surfaces"]]
-        agsi["surfaces"][2]["bottomOf"] = []
-        with pytest.raises(AGSIExporterException, match=f"names 0 bottom surfaces for element '{ALLUVIUM}'"):
-            export([dataclasses.replace(obj, extensions={"agsi": agsi})], local_data_client, path)
-
-    def test_zero_thickness_element_is_not_exported(
+    @pytest.mark.parametrize("indices", [[2], [2, 3]])
+    def test_historical_surfaces_extension_is_ignored(
         self,
         straight_wkt_dir: Path,
         local_data_client: MagicMock,
         tmp_path: Path,
         caplog: pytest.LogCaptureFixture,
+        indices: list[int],
+    ) -> None:
+        pinch(straight_wkt_dir, indices)
+        obj = import_mini(straight_wkt_dir, local_data_client, base_elevation=-50.0)
+        export([obj], local_data_client, tmp_path / "plain.agsi")
+        legacy = [  # as written by earlier importers: complete top and bottom of each element
+            {"name": surface.name, "topOf": top_of, "bottomOf": bottom_of}
+            for surface, top_of, bottom_of in zip(
+                obj.surfaces, [[SURFICIAL], [ALLUVIUM], []], [[], [SURFICIAL], [ALLUVIUM]]
+            )
+        ]
+        for number, entries in enumerate([legacy, legacy[:1], "not a list"]):
+            path = tmp_path / f"historical-{number}.agsi"
+            with caplog.at_level(logging.INFO):
+                export([with_historical_surfaces(obj, entries)], local_data_client, path)
+            assert "extensions.agsi.surfaces (top/bottom relationships recorded by earlier" in caplog.text
+            assert package_bytes(path) == package_bytes(tmp_path / "plain.agsi")
+
+    def test_zero_thickness_element_is_not_exported(
+        self, straight_wkt_dir: Path, local_data_client: MagicMock, tmp_path: Path
     ) -> None:
         pinch(straight_wkt_dir, list(range(6)))
         obj = import_mini(straight_wkt_dir, local_data_client, base_elevation=-50.0)
         assert [v.layer for v in obj.volumes] == [ALLUVIUM]
-        with caplog.at_level(logging.WARNING):
-            package = export([obj], local_data_client, tmp_path / "out.agsi")
-        assert f"element '{SURFICIAL}' has zero thickness everywhere" in caplog.text
+        package = export([obj], local_data_client, tmp_path / "out.agsi")
         assert [e.element_id for e in package.models[0].agsi_model_element] == [ALLUVIUM]
 
 
@@ -658,6 +681,15 @@ class TestExportAgsi:
             export_agsi(tmp_path / "x.agsi", [EvoObjectMetadata(object_id=self.OBJECT_ID)])
 
 
+PART = re.compile(r" \(part \d+\)$")
+
+
+def run_of(line: np.ndarray, source: np.ndarray) -> bool:
+    """Whether ``line`` is a run of consecutive vertices of ``source``."""
+    starts = np.flatnonzero((source == line[0]).all(axis=1))
+    return any(np.array_equal(source[start : start + len(line)], line) for start in starts)
+
+
 @pytest.mark.skipif(not SAMPLE_DIR, reason="Set AGSI_SAMPLE_DIR to the folder of the converted AGSi 1.0.1 samples")
 def test_straight_synthetic_sample_round_trip(local_data_client: MagicMock, tmp_path: Path) -> None:
     assert SAMPLE_DIR is not None
@@ -665,45 +697,55 @@ def test_straight_synthetic_sample_round_trip(local_data_client: MagicMock, tmp_
     obj = import_mini(path, local_data_client, base_elevation=-100.0)
     # Units that pinch out are several (valid, simple) Evo volumes: 22 volumes for 11 elements.
     assert (len(obj.volumes), len(obj.surfaces)) == (22, 12)
-    assert Counter(v.layer for v in obj.volumes)[ALLUVIUM] > 1
-    exported = export([obj], local_data_client, tmp_path / "out.agsi")
+    assert "surfaces" not in obj.extensions["agsi"]
+    first = tmp_path / "first.agsi"
+    exported = export([obj], local_data_client, first)
 
     source = AgsiPackage.open(path)
     (section,) = [model for model in source.models if model.alignment_id]
+    original = {e.element_id: e for e in section.agsi_model_element}
     (exported_section, _) = exported.models
-    original = section.agsi_model_element
+    assert (exported_section.model_id, exported_section.alignment_id) == (section.model_id, section.alignment_id)
     elements = exported_section.agsi_model_element
 
-    # One element per source element, with its fields, parameters and complete top and bottom lines.
-    assert [e.element_id for e in elements] == [e.element_id for e in original] and len(elements) == 11
-    for old, new in zip(original, elements):
+    # Separate volumes of one unit are separate '(part n)' elements; touching volumes are merged.
+    bases = [PART.sub("", e.element_id) for e in elements]
+    assert list(dict.fromkeys(bases)) == list(original)
+    assert {base: n for base, n in Counter(bases).items() if n > 1} == {
+        "Profile Surficial Alignment NB": 4,
+        "Profile Alluvium Alignment NB": 5,
+        "Profile River Terrace Deposits Alignment NB": 2,
+        "Profile Woolwich Formation Lower Shelly Clay Alignment NB": 2,
+        "Profile Upnor Formation Alignment NB": 2,
+    }
+    assert len(elements) == 21
+    for base, new in zip(bases, elements):
+        old = original[base]
         assert (new.element_type, new.description, new.geometry_object) == (
             old.element_type,
             old.description,
             old.geometry_object,
         )
-        assert new.remarks is None
+        assert (new.remarks is not None) == (new.element_id != base)
         assert [p.model_dump(exclude_none=True) for p in new.agsi_data_parameter_value] == [
             p.model_dump(exclude_none=True) for p in old.agsi_data_parameter_value
         ]
+        # Every profile is a run of the source line: no geometry is invented.
         for which in ("agsi_geometry_top", "agsi_geometry_bottom"):
             old_geometry, new_geometry = getattr(old.agsi_geometry, which), getattr(new.agsi_geometry, which)
             if old_geometry is None:
                 assert new_geometry is None  # Chalk: top only, down to the model boundary
                 continue
-            np.testing.assert_array_equal(profile(exported, new_geometry), profile(source, old_geometry))
-    # The 10 contacts between adjacent units are one shared file each; nothing else is written.
-    for above, below in zip(elements, elements[1:]):
-        assert below.agsi_geometry.agsi_geometry_top.file_uri == above.agsi_geometry.agsi_geometry_bottom.file_uri
-    with zipfile.ZipFile(tmp_path / "out.agsi") as archive:
+            assert run_of(profile(exported, new_geometry), profile(source, old_geometry))
+    with zipfile.ZipFile(first) as archive:
         profiles = [name for name in archive.namelist() if name.startswith("Profiles/")]
-    assert len(profiles) == 11
+    assert len(profiles) == 40
     assert exported_section.agsi_model_boundary.bottom_elevation == -100.0
 
-    # Importing the export again gives the same object: 22 volumes and 12 surfaces over the same chunks.
-    again = import_mini(tmp_path / "out.agsi", local_data_client)
-    assert_same_import(again, obj, local_data_client)
-    assert again.layer_order == obj.layer_order
-    for new_attribute, old_attribute in zip(again.volume_attributes, obj.volume_attributes, strict=True):
-        assert new_attribute.name == old_attribute.name
-        assert loader(local_data_client)(new_attribute.values).equals(loader(local_data_client)(old_attribute.values))
+    # The split package is stable: importing and exporting it again changes nothing.
+    again = assert_stable(first, local_data_client, tmp_path)
+    assert (len(again.volumes), len(again.surfaces), len(again.layer_order)) == (22, 41, 21)
+    # With or without relationships recorded by earlier importers, the export is the same.
+    legacy = [{"name": s.name, "topOf": [], "bottomOf": []} for s in obj.surfaces]
+    export([with_historical_surfaces(obj, legacy)], local_data_client, tmp_path / "legacy.agsi")
+    assert package_bytes(tmp_path / "legacy.agsi") == package_bytes(first)

@@ -91,13 +91,10 @@ class TestStraightSection:
                 "alignmentName": "NB alignment",
                 "startChainage": 0.0,
                 "alignmentLength": math.hypot(END[0] - START[0], END[1] - START[1]),
-                "surfaces": [
-                    {"name": f"Top of {SURFICIAL}", "topOf": [SURFICIAL], "bottomOf": []},
-                    {"name": f"Base of {SURFICIAL} / Top of {ALLUVIUM}", "topOf": [ALLUVIUM], "bottomOf": [SURFICIAL]},
-                    {"name": f"Base of {ALLUVIUM}", "topOf": [], "bottomOf": [ALLUVIUM]},
-                ],
             }
         }
+        # No top/bottom relationships are recorded: the surfaces themselves are the geometry.
+        assert "surfaces" not in obj.extensions["agsi"]
         assert [folder.name for folder in obj.folders] == ["NB alignment"]
         assert [item.section_index for item in obj.folders[0].items] == [0]
 
