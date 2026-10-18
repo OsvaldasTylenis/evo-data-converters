@@ -564,6 +564,127 @@ class TestMapping:
             assert crs.ogc_wkt in xy.remarks
 
 
+class TestCodeSets:
+    """Interim code sets: the exporter defines every codeID and caseID it writes."""
+
+    @staticmethod
+    def code_sets(package: AgsiPackage) -> dict[str, list[dict[str, Any]]]:
+        project = package.document.ags_project
+        sets = project.ags_project_code_set if project else []
+        assert all(s["usedByObject"] == "agsiDataParameterValue" for s in sets)
+        by_attribute = {s["usedByAttribute"]: s["agsProjectCode"] for s in sets}
+        assert len(by_attribute) == len(sets)
+        return by_attribute
+
+    @classmethod
+    def assert_resolved(cls, package: AgsiPackage) -> dict[str, list[str]]:
+        """Every codeID and caseID written is defined once in the code set of its attribute."""
+        sets = cls.code_sets(package)
+        defined = {attribute: [c["codeID"] for c in codes] for attribute, codes in sets.items()}
+        for attribute, codes in defined.items():
+            assert len(codes) == len(set(codes))
+        used: dict[str, set[str]] = {"codeID": set(), "caseID": set()}
+        for model in package.models:
+            for element in model.agsi_model_element:
+                for parameter in element.agsi_data_parameter_value:
+                    used["codeID"].add(parameter.code_id)
+                    if parameter.case_id is not None:
+                        used["caseID"].add(parameter.case_id)
+        assert {a: set(c) for a, c in defined.items()} == {a: c for a, c in used.items() if c}
+        return defined
+
+    def test_deduplicated_across_elements(
+        self, mini: GeologicalSections_V1_2_0, local_data_client: MagicMock, tmp_path: Path
+    ) -> None:
+        package = export([mini], local_data_client, tmp_path / "out.agsi")
+        assert self.code_sets(package) == {
+            "codeID": [
+                {"codeID": "UnitWeightBulk", "description": "UnitWeightBulk"},
+                {"codeID": "UndrainedShearStrength", "description": "UndrainedShearStrength"},
+                {"codeID": "Comment", "description": "Comment"},
+            ],
+            "caseID": [{"codeID": "Lower", "description": "Lower"}],
+        }
+        self.assert_resolved(package)
+        (code_set, case_set) = package.document.ags_project.ags_project_code_set
+        assert "units" not in json.dumps(code_set)
+        assert code_set["remarks"] == case_set["remarks"]
+
+    def test_shared_across_sections_and_objects(
+        self, mini: GeologicalSections_V1_2_0, local_data_client: MagicMock, tmp_path: Path
+    ) -> None:
+        moved = dataclasses.replace(mini.sections[0], name="South", origin=[539600.0, 179800.0, 5.0])
+        two = dataclasses.replace(mini, name="Two sections", sections=[mini.sections[0], moved])
+        package = export([two, mini], local_data_client, tmp_path / "out.agsi")
+        assert len([m for m in package.models if m.agsi_model_element]) == 3
+        assert self.assert_resolved(package) == {
+            "codeID": ["UnitWeightBulk", "UndrainedShearStrength", "Comment"],
+            "caseID": ["Lower"],
+        }
+
+    def test_no_parameters(self, straight_wkt_dir: Path, local_data_client: MagicMock, tmp_path: Path) -> None:
+        package = export(
+            [import_mini(straight_wkt_dir, local_data_client, base_elevation=-50.0)],
+            local_data_client,
+            tmp_path / "out.agsi",
+        )
+        assert all(not e.agsi_data_parameter_value for e in package.models[0].agsi_model_element)
+        assert package.document.ags_project.ags_project_code_set == []
+        assert b"agsProjectCodeSet" not in package.read_bytes(package.main_file)
+
+    def test_codes_without_cases(self, straight_wkt_dir: Path, local_data_client: MagicMock, tmp_path: Path) -> None:
+        def no_cases(document: dict[str, Any]) -> None:
+            enrich(document)
+            for element in document["agsiModel"][0]["agsiModelElement"]:
+                for parameter in element["agsiDataParameterValue"]:
+                    parameter.pop("caseID", None)
+
+        edit_document(straight_wkt_dir, no_cases)
+        package = export(
+            [import_mini(straight_wkt_dir, local_data_client, base_elevation=-50.0)],
+            local_data_client,
+            tmp_path / "out.agsi",
+        )
+        assert list(self.assert_resolved(package)) == ["codeID"]
+
+    def test_unusual_codes_and_skipped_values(
+        self, mini: GeologicalSections_V1_2_0, local_data_client: MagicMock, tmp_path: Path
+    ) -> None:
+        save = local_data_client.save_table
+
+        def text(name: str, values: list[Optional[str]]) -> StringAttribute_V1_1_0:
+            return StringAttribute_V1_1_0(
+                name=name, key=name, values=StringArray_V1_0_1(**save(pa.table({"values": pa.array(values)})))
+            )
+
+        unusual = ' Effective cohesion c\' (kPa) / ü "x" $..[*] '
+        flag = BoolAttribute_V1_1_0(
+            name="Flag", key="Flag", values=BoolArray1_V1_0_1(**save(pa.table({"values": pa.array([True, False])})))
+        )
+        attributes = [
+            *mini.volume_attributes,
+            text(unusual, [None, "a"]),
+            text("unitweightbulk", ["b", "c"]),  # differs from UnitWeightBulk only in case
+            StringAttribute_V1_1_0(
+                name="All missing",
+                key="All missing",
+                values=StringArray_V1_0_1(**save(pa.table({"values": pa.array([None, None], pa.string())}))),
+            ),
+            flag,
+        ]
+        package = export(
+            [dataclasses.replace(mini, volume_attributes=attributes)], local_data_client, tmp_path / "out.agsi"
+        )
+        # Codes are kept exactly; only codes of values written are defined.
+        assert self.assert_resolved(package)["codeID"] == [
+            "UnitWeightBulk",
+            "UndrainedShearStrength",
+            "Comment",
+            "unitweightbulk",
+            unusual,
+        ]
+
+
 class TestErrors:
     def test_non_vertical_section(
         self, mini: GeologicalSections_V1_2_0, local_data_client: MagicMock, tmp_path: Path
@@ -719,6 +840,9 @@ def test_straight_synthetic_sample_round_trip(local_data_client: MagicMock, tmp_
         "Profile Upnor Formation Alignment NB": 2,
     }
     assert len(elements) == 21
+    # The codes in use are defined again (descriptions are not kept in Evo, so they repeat the code).
+    source_codes = {c["codeID"] for s in source.document.ags_project.ags_project_code_set for c in s["agsProjectCode"]}
+    assert set(TestCodeSets.assert_resolved(exported)["codeID"]) == source_codes
     for base, new in zip(bases, elements):
         old = original[base]
         assert (new.element_type, new.description, new.geometry_object) == (

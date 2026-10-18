@@ -622,7 +622,36 @@ class _Builder:
 
     # -- output --
 
+    def _code_sets(self) -> list[dict[str, Any]]:
+        """One code set per ``agsiDataParameterValue`` code attribute (codeID, caseID) in use.
+
+        Holds every distinct value written, in order of first use. Evo keeps no code descriptions
+        or units, so each description repeats the code and no units are given.
+        """
+        used: dict[str, dict[str, None]] = {"codeID": {}, "caseID": {}}
+        for model in self.models:
+            for element in model.get("agsiModelElement", []):
+                for parameter in element.get("agsiDataParameterValue", []):
+                    for attribute, codes in used.items():
+                        if attribute in parameter:
+                            codes.setdefault(parameter[attribute])
+        return [
+            {
+                "description": f"Codes used by agsiDataParameterValue.{attribute} in this file",
+                "usedByObject": "agsiDataParameterValue",
+                "usedByAttribute": attribute,
+                "agsProjectCode": [{"codeID": code, "description": code} for code in codes],
+                "remarks": "Generated on export from the codes in use; descriptions repeat the codes.",
+            }
+            for attribute, codes in used.items()
+            if codes
+        ]
+
     def build(self, main_file: str) -> AgsiExport:
+        project: dict[str, Any] = {"projectName": self.title, "agsProjectCoordinateSystem": self.systems}
+        code_sets = self._code_sets()
+        if code_sets:
+            project["agsProjectCodeSet"] = code_sets
         document = {
             "agsSchema": {"name": "AGSi", "version": AGSI_VERSION, "link": AGSI_LINK},
             "agsFile": {
@@ -636,7 +665,7 @@ class _Builder:
                 "their alignments are straight lines in a separate plan model. Profiles shared by neighbouring "
                 "elements are written once and referenced by both.",
             },
-            "agsProject": {"projectName": self.title, "agsProjectCoordinateSystem": self.systems},
+            "agsProject": project,
             "agsiModel": self.models,
         }
         return AgsiExport(title=self.title, main_file=main_file, document=document, files=self.files)

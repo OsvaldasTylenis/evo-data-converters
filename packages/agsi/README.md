@@ -111,6 +111,7 @@ package from objects already in memory: `build_agsi_export([SectionsSource(obj, 
 | `agsiGeometryAreaFromLines` | top and bottom WKT `LINESTRING (chainage elevation, ...)` profiles; identical lines (shared contacts) are written once and referenced by both units |
 | `agsiModelBoundary` | `topElevation` / `bottomElevation` when a generated horizontal `BoundarySurface` line closes the units at one elevation; that line is then omitted from the profiles |
 | `agsiDataParameterValue` | one per volume attribute value: continuous and integer → `valueNumeric`, string and category → `valueText`; `codeID`/`caseID` from `parameterColumns`, else the attribute name. Missing values are skipped; other attribute types (e.g. bool) are not exported (with a warning) |
+| `agsProjectCodeSet` | one set per parameter attribute in use (`usedByObject` `agsiDataParameterValue`, `usedByAttribute` `codeID` and, when any are written, `caseID`), holding one `agsProjectCode` per distinct value written (exact string, first-use order, shared by all sections and objects). Evo keeps no code descriptions or units, so `description` repeats the code and `units` is omitted; none is written without parameters |
 
 Constraints (each raises `UnsupportedSectionGeometryError` and nothing is written):
 
@@ -141,7 +142,8 @@ Other behaviour:
 * Not kept: the original XY `systemID`, geometry descriptions, revisions and remarks, and the
   number formatting of the source WKT; duplicate source files of one contact become one file;
   palette colours become explicit `colourRGB`; mixed numeric/text parameters (stored as strings
-  in Evo) come back as `valueText`.
+  in Evo) come back as `valueText`; source code sets (code descriptions, units, `sourceURI`) are
+  replaced by the generated sets above.
 
 Round trip: the first export of an imported file writes each unit that pinches out (except at
 exact single pinch-out vertices) as several `"(part n)"` elements, so the straight synthetic
@@ -152,7 +154,9 @@ separate files (40 profiles). No geometry is invented. Importing that package ag
 volumes and 41 surfaces, and further round trips are stable: the second export only drops the
 `"(part n)"` remarks (element remarks are not kept in Evo), after which the files are
 byte-identical when the same title is used. The files are not byte-identical to the source (see
-above). Exported packages validate against the AGSi 1.0.1 JSON schema.
+above). Exported packages validate against the AGSi 1.0.1 JSON schema, and every parameter
+`codeID` and `caseID` is defined in a generated code set, so the official AGSi validator's code
+reference check passes.
 
 ### Reading AGSi packages
 
